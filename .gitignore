@@ -1,0 +1,116 @@
+# ==============================================================================
+# CivicLens — Master Git Ignore (Cybersecurity & Cleanliness)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Critical Cybersecurity: Credentials, Keys & Environment Variables
+# ------------------------------------------------------------------------------
+.env
+.env.*
+*.env
+*.env.local
+*.env.development.local
+*.env.test.local
+*.env.production.local
+!*.env.example
+
+# Private API keys, certificates & keystores
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.p8
+*.jks
+*.keystore
+*.mobileprovision
+
+# ------------------------------------------------------------------------------
+# 2. Internal Agent / Workspace Dumps, Private Guides & Private Logs
+# ------------------------------------------------------------------------------
+antigravity_export/
+antigravity_export/**
+.system_generated/
+*EVALUATION*.md
+PROJECT_EVALUATION_GUIDE.md
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ------------------------------------------------------------------------------
+# 3. Node & JavaScript / React Native / Expo
+# ------------------------------------------------------------------------------
+node_modules/
+*/node_modules/
+.expo/
+*/.expo/
+dist/
+web-build/
+expo-env.d.ts
+.metro-health-check*
+.tsbuildinfo
+
+# Generated native build folders (if ever ejected)
+/ios/
+/android/
+*/ios/
+*/android/
+.kotlin/
+
+# ------------------------------------------------------------------------------
+# 4. Python Backend & Virtual Environments
+# ------------------------------------------------------------------------------
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.env/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.pytest_cache/
+
+# ------------------------------------------------------------------------------
+# 5. OS & Editor Metadata
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.sublime-workspace
+*.sublime-project
