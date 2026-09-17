@@ -1,0 +1,393 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{setspace}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{titlesec}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    urlcolor=blue!50!black,
+    pdftitle={CivicLens: Intelligent Civic Complaint Routing and Accountability System},
+    pdfauthor={Aadish Jain, Adarsh Sharma, Kovid Kumar}
+}
+
+\setstretch{1.12}
+\setlist[itemize]{leftmargin=*, itemsep=3pt, topsep=4pt}
+\setlist[enumerate]{leftmargin=*, itemsep=3pt, topsep=4pt}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.7em}{}
+
+\title{
+    \textbf{CivicLens}\\[0.35em]
+    \large Intelligent Civic Complaint Routing and Accountability System\\[0.5em]
+    \normalsize Project Report
+}
+\author{
+    Aadish Jain \and Adarsh Sharma \and Kovid Kumar\\
+    \small Computer Science and Engineering (CSE)\\
+    \small Thapar Institute of Engineering and Technology, Patiala
+}
+\date{21 August 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\vspace{1em}
+\begin{center}
+\textbf{Submitted to: Hardik Gujral}
+\end{center}
+
+\vfill
+
+\begin{abstract}
+CivicLens is a deployable civic complaint routing and accountability platform designed for a single pilot city. The system enables citizens to report civic issues such as potholes, garbage accumulation, broken streetlights, and water leaks through a low-friction camera-based workflow. Artificial intelligence classifies the submitted image, geospatial processing identifies the responsible ward, and configurable routing rules direct the complaint to the appropriate department. The platform provides structural deadlines through an SLA engine, automatic escalation on breaches, and a tamper-evident audit trail. An anti-abuse layer combines trust scoring, rate limiting, duplicate detection, and clustering detection. The architecture uses asynchronous queue-based AI processing, PostgreSQL/PostGIS, Redis/Celery, FastAPI, and a React-based citizen interface, with containerized deployment and CI/CD.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+\section{Higher-Order Goal --- Secondary Framing}
+
+This project aims to make urban civic accountability structural rather than discretionary: a citizen who reports a pothole, a garbage pile-up, a broken streetlight, or a water leak should not have to trust that the right department eventually notices. The system itself should guarantee correct routing, a visible deadline, and an auditable trail.
+
+While the underlying goal (better urban governance) is broader than any single deployment, the immediate engineering objective is to translate that goal into a measurable, production-shaped software system for a single pilot city or ward-set.
+
+\section{Time-to-Value --- Primary Heuristic}
+
+\begin{itemize}
+    \item \textbf{Citizen effort first:} The primary success heuristic is that a citizen can go from photographing a problem to holding a complaint ID and an estimated SLA deadline in under 60 seconds (Goal G1). The complete capture $\rightarrow$ submit $\rightarrow$ confirmation loop must remain completable in under 60 seconds even on a low-end Android device (NFR-11).
+
+    \item \textbf{Respond before you think:} The API returns a complaint ID and an estimated SLA deadline immediately on submission---before the AI classification pipeline has even run (FR-C4). Perceived value is therefore delivered synchronously while the heavier CV/LLM work happens asynchronously on a queue.
+
+    \item \textbf{Iteration within a fixed window:} The project is scoped to a course timeline of roughly 12--14 weeks with a single pilot city, or a representative subset of wards with available or approximated boundary data. This fixes scope to the core feature set and pushes multi-city and multi-language support to future work.
+
+    \item \textbf{Fast, safe releases:} GitHub Actions CI/CD and a Docker Compose $\rightarrow$ Render/Railway deployment path are used from early in the project so that increments can be shipped to a staging environment repeatedly and safely rather than accumulating into one large release.
+\end{itemize}
+
+\section{Problem Statement}
+
+Citizens have no low-friction way to report civic issues---potholes, garbage, broken streetlights, and water leaks---that guarantees the report reaches the correct department, is tracked transparently, and holds the responsible authority accountable to a deadline. Existing government portals are slow, poorly routed, and offer no real accountability trail.
+
+In particular:
+\begin{itemize}
+    \item Reports are frequently mis-routed because there is no automated, location-aware mapping from an issue to the department actually responsible for it.
+    \item Citizens cannot see a live, trustworthy status for their complaint, nor who last acted on it and when.
+    \item There is no structural deadline: resolution timelines are discretionary, and breaches are not automatically escalated.
+    \item Portals that allow open submission are vulnerable to spam and coordinated flooding, which existing systems can only address through manual moderation that does not scale.
+\end{itemize}
+
+\subsection*{Why This Matters Now}
+
+With limited municipal staff bandwidth, a system that removes ambiguity from routing and makes deadlines and escalation automatic can noticeably reduce resolution delay and repeated or duplicate submissions without requiring more staff.
+
+\section{Proposed Solution --- Software Proposition}
+
+\subsection{Overview}
+
+A citizen photographs an issue using live camera capture. Gallery upload is intentionally disallowed to discourage stale or unrelated photos. An AI pipeline classifies the issue and drafts a formal complaint description. The system geofences the auto-captured GPS location to the correct ward using PostGIS, and routes the complaint to the correct department automatically via a configurable category $\times$ ward $\rightarrow$ department mapping.
+
+An SLA clock starts on verification, escalates automatically on breach, and every status change is logged in an auditable, tamper-evident trail---visible to the citizen and, in aggregate and anonymized form, to the public.
+
+\subsection{Stakeholders / User Roles}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.25\textwidth} p{0.67\textwidth}}
+\toprule
+Role & Description \\
+\midrule
+Citizen & Reports issues, tracks status, confirms or disputes resolution. \\
+Department Official & Reviews assigned complaints, updates status, submits resolution proof. \\
+Supervisor & Receives complaints escalated on SLA breach. \\
+City Admin & Views aggregate dashboards; manages wards, departments, and SLA rules. \\
+Public / Auditor & Views an anonymized, aggregate accountability dashboard; read-only, no login required. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Core Workflow}
+
+The complaint moves through a defined lifecycle state machine:
+
+\begin{center}
+\textbf{Submitted} $\rightarrow$ \textbf{Assigned} $\rightarrow$ \textbf{In Progress} $\rightarrow$ \textbf{Resolved} $\rightarrow$ \textbf{Closed}
+\end{center}
+
+There are two conditional branches:
+\begin{itemize}
+    \item An SLA breach on an Assigned/In Progress complaint moves it to \textbf{Escalated}, where it is reassigned upward to a supervisor.
+    \item A citizen who disputes a Resolved complaint reopens it back to \textbf{Assigned}.
+\end{itemize}
+
+End-to-end, a single complaint's journey looks like:
+\begin{itemize}
+    \item The citizen registers/logs in via phone number + OTP, then submits a complaint via live camera capture plus auto-captured GPS location, with an optional free-text note.
+    \item The system immediately returns a complaint ID and an estimated SLA deadline, then enqueues the photo and metadata for asynchronous AI processing.
+    \item A CV/LLM worker classifies the photo (category, severity, confidence score) and drafts a formatted complaint description grounded strictly in the classification output and the citizen's note.
+    \item If confidence is below threshold (default 0.6), the complaint routes to an official's low-confidence review queue for manual confirmation instead of auto-processing.
+    \item A PostGIS spatial query resolves the GPS point to a ward polygon, falling back to the nearest ward within a configurable distance threshold if the point falls outside all polygons. A configurable lookup table routes the complaint to the correct department/official, load-balanced across officials in that ward.
+    \item The submission starts as a low-trust report and only becomes a verified complaint---starting the SLA clock and counting toward public accountability metrics---after independent confirmation or official field verification.
+    \item The official assigns a field worker, updates status, and, when marking a complaint Resolved, must attach a proof photo and notes. Every status change is logged with official ID, timestamp, and notes as an immutable record.
+    \item The citizen receives an SMS/email notification on every status change and can confirm the resolution as satisfactory ($\rightarrow$ Closed) or dispute it ($\rightarrow$ Reopened).
+    \item A scheduled process continuously checks for SLA breaches and automatically escalates overdue complaints to a supervisor, with the escalation visible to the citizen and counted against the department's public compliance metric.
+\end{itemize}
+
+\subsection{Scope and Operational Constraints (v1)}
+
+\textbf{Out of scope for v1:} payment processing/fines; multi-city deployment (a single pilot city or ward-set for the course project); native mobile apps (a responsive PWA is sufficient); and automated field-worker dispatch/routing (human officials assign manually).
+
+Operational constraints for the pilot setting:
+\begin{itemize}
+    \item The citizen flow must remain usable on low-to-mid-range Android devices and completable end-to-end in under 60 seconds (NFR-11).
+    \item Officials are provisioned by admin; there is no public self-registration for the official role.
+    \item LLM API usage is rate-limited/budgeted. The core submission flow must degrade gracefully: the queue holds jobs and retries once the service resumes rather than rejecting submissions if the LLM API is unavailable (NFR-10).
+\end{itemize}
+
+\section{Solution Approach --- Engineering Focus}
+
+This is an engineering-focused project. The emphasis is on correct, scalable workflow, geospatial routing, queue-based asynchronous processing, and abuse resistance rather than on novel ML research.
+
+\subsection{AI / LLM Classification Pipeline \& Guardrails}
+
+\begin{itemize}
+    \item Each submitted photo is classified into a category (pothole, garbage, streetlight, water\_leak, other), a severity (low/medium/high), and a confidence score.
+    \item Below the configurable confidence threshold (default 0.6), the complaint is routed to the official's low-confidence review queue instead of being auto-processed.
+    \item The complaint description is drafted by the LLM but is grounded strictly in the structured classification output and the citizen's own note. The model is not permitted to invent facts.
+    \item The vision model is explicitly instructed to treat any text or signage visible in a photo as descriptive content only, never as instructions. This acts as a prompt-injection guardrail against adversarial images.
+\end{itemize}
+
+\subsection{Location \& Routing (Geospatial)}
+
+\begin{itemize}
+    \item GPS points are resolved to a ward polygon using PostGIS spatial queries.
+    \item Points falling outside all ward polygons due to GPS noise fall back to the nearest ward within a configurable distance threshold.
+    \item Ward $\rightarrow$ department routing uses a configurable lookup table (category $\times$ ward $\rightarrow$ department/official), maintainable by an admin without a code deploy.
+    \item Where a department has multiple officials in a ward, assignment balances by each official's current open-complaint load.
+\end{itemize}
+
+\subsection{Anti-Abuse \& Trust Layer}
+
+Rather than relying on manual moderation, abuse resistance is built into the data model and pipeline:
+\begin{itemize}
+    \item A submission starts as a low-trust report and only becomes a verified complaint---starting the SLA clock and counting toward public metrics---after independent confirmation or official field verification.
+    \item Each account carries a trust score, weighted by its history of verified-versus-rejected past reports.
+    \item Rate limiting is applied per account, per device fingerprint, and per phone number.
+    \item Duplicate reports are detected via perceptual image hashing combined with location proximity within a certain radius, and are linked to a single canonical complaint rather than spawning separate SLA clocks.
+    \item Abnormal temporal/spatial clustering (many reports in the same small area and short time window from low-trust accounts) is detected and flagged for admin review rather than auto-processed.
+    \item EXIF capture-timestamp and, where available, EXIF geotag are cross-checked against submission metadata, and mismatches are flagged.
+\end{itemize}
+
+\subsection{SLA \& Escalation Engine}
+
+\begin{itemize}
+    \item Every verified complaint gets an SLA deadline computed from configurable \texttt{sla\_rules} (category $\times$ severity).
+    \item A scheduled process (Celery beat / cron) checks for SLA breaches and automatically escalates overdue complaints to a supervisor---no manual trigger required.
+    \item Escalations are visible to the citizen and counted against the responsible department's public compliance metric.
+\end{itemize}
+
+\subsection{System Architecture}
+
+A queue-based, horizontally scalable architecture decouples the fast synchronous submission path from the slower AI/CV processing path:
+\begin{itemize}
+    \item \textbf{Client apps:} Citizen PWA and an Admin dashboard.
+    \item \textbf{API server (FastAPI):} Validates the request, stores the photo, creates the DB row, enqueues a processing job, and returns immediately.
+    \item \textbf{Queue (Redis + Celery):} Decouples submission from processing.
+    \item \textbf{CV + LLM worker(s):} Classify $\rightarrow$ confidence check $\rightarrow$ draft complaint $\rightarrow$ geofence lookup $\rightarrow$ routing.
+    \item \textbf{PostgreSQL + PostGIS:} Stores complaints, wards, users, officials, SLA rules, and the audit log.
+    \item \textbf{SLA scheduler (Celery beat / cron):} Scans for breaches and auto-escalates.
+    \item \textbf{Third-party services:} The Vision/LLM API and the SMS/email gateway.
+\end{itemize}
+
+\subsection{Non-Functional Requirements}
+
+\small
+\begin{longtable}{p{0.12\textwidth} p{0.17\textwidth} p{0.64\textwidth}}
+\toprule
+\textbf{ID} & \textbf{Category} & \textbf{Requirement} \\
+\midrule
+NFR-1 & Performance & API response for complaint submission (excluding async AI processing) $<$ 500ms. \\
+NFR-2 & Scalability & AI/CV processing workers are horizontally scalable---stateless, queue-consumer pattern. \\
+NFR-3 & Reliability & Failed AI processing jobs retry with exponential backoff; after $N$ failures, route to human review instead of silent failure. \\
+NFR-4 & Reliability & Status updates and audit-log writes occur in the same DB transaction---no partial state. \\
+NFR-5 & Security & Role-based access control---citizens see only their own complaints; officials see only their ward/department queue. \\
+NFR-6 & Security & Photo access via signed, time-limited URLs---the storage bucket is never publicly exposed. \\
+NFR-7 & Security & Submission endpoint is rate-limited to control abuse and LLM API cost. \\
+NFR-8 & Integrity & Status history is tamper-evident (hash-chained records). \\
+NFR-9 & Privacy & Complaint data handling aligned with India's Digital Personal Data Protection Act (DPDP), 2023---citizen PII is never exposed on the public accountability dashboard. \\
+NFR-10 & Availability & Core submission flow degrades gracefully if the LLM API is unavailable---the queue holds jobs and retries once service resumes rather than rejecting submissions. \\
+NFR-11 & Usability & Citizen flow (capture $\rightarrow$ submit $\rightarrow$ confirmation) completable in under 60 seconds on a low-end Android device. \\
+NFR-12 & Maintainability & Category $\rightarrow$ department mappings and SLA rules are configurable by admin without a code deploy. \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Evaluation Criterion --- Measurable and Attributable}
+
+Success is defined using metrics tied directly to the goals and non-functional requirements above, each attributable to a database timestamp, a configured threshold, or an admin-facing dashboard figure rather than to subjective judgement.
+
+\subsection{Primary Evaluation Metrics}
+
+\begin{itemize}
+    \item \textbf{Citizen submission latency:} Wall-clock time from opening the capture flow to receiving a complaint ID and SLA deadline. Target: under 60 seconds end-to-end (G1, NFR-11), with the API response itself returned before AI processing completes (FR-C4) and under 500ms excluding async AI processing (NFR-1). Attribution: client-side session timing plus API request timestamps.
+
+    \item \textbf{SLA compliance rate:} Percentage of verified complaints resolved within their computed SLA deadline, per department, as surfaced on the admin dashboard (FR-A3) and used as the department's public accountability figure, including breaches that were auto-escalated (FR-S3). Attribution: \texttt{sla\_rules} deadline versus Resolved-status timestamp.
+\end{itemize}
+
+\subsection{Secondary Evaluation Metrics}
+
+\begin{itemize}
+    \item \textbf{Low-confidence review rate:} The proportion of submissions routed to the official review queue instead of being auto-processed, tracked against the configurable confidence threshold (default 0.6) to gauge classifier reliability (FR-AI2).
+
+    \item \textbf{Duplicate-merge accuracy:} Proportion of true duplicates correctly linked to a single canonical complaint via perceptual hashing + location proximity, versus duplicates that slip through as separate SLA clocks (FR-T4).
+
+    \item \textbf{Abuse-cluster flag precision:} Proportion of admin-reviewed flagged clusters that are confirmed as coordinated/spam activity versus false positives (FR-T5, FR-A4).
+
+    \item \textbf{Escalation rate:} Proportion of verified complaints that breach SLA and are auto-escalated, tracked per department over time (FR-S2, FR-A3).
+
+    \item \textbf{Report-to-verified conversion rate:} Proportion of low-trust reports that become verified complaints, as a proxy for submission quality and trust-score calibration (FR-T1, FR-T2).
+\end{itemize}
+
+\subsection{Pilot Validation Plan}
+
+Consistent with the single-pilot-city/ward-set scope, validation is run within the same city/ward boundary used for development, with officials provisioned by admin per role rather than through open self-registration.
+
+Each of the three team roles (backend/routing, frontend/citizen flow, CV/LLM/deployment) instruments its own layer with timestamps so that the metrics above can be computed directly from the audit log and admin dashboard, rather than from a survey, once a small pilot set of complaints has moved through the full lifecycle.
+
+\section{Scalability --- With Foresight}
+
+The system is designed to scale in both a theoretical and an operational sense.
+
+\subsection{Theoretical Scalability}
+
+\begin{itemize}
+    \item \textbf{Decoupling:} The API server only validates, stores, and enqueues---all AI/CV work happens on stateless, queue-consuming workers that can be scaled horizontally independent of the API tier (NFR-2).
+    \item \textbf{Geospatial indexing:} Ward resolution and routing use PostGIS spatial indexes rather than linear scans.
+    \item \textbf{Graceful degradation under load or third-party outage:} If the LLM API is unavailable, jobs queue and retry with exponential backoff instead of failing submissions outright (NFR-3, NFR-10).
+    \item \textbf{Transactional integrity at scale:} Status updates and audit-log writes share a DB transaction, so partial state cannot accumulate as throughput grows (NFR-4).
+\end{itemize}
+
+\subsection{Operational Deployability}
+
+\begin{itemize}
+    \item Containerized local development (Docker Compose) with a path to managed hosting (Render/Railway) for the demo/pilot.
+    \item A managed relational database with a spatial extension (PostgreSQL + PostGIS) and a managed cache/broker (Redis).
+    \item CI/CD via GitHub Actions to keep releases frequent and low-risk.
+    \item Object storage abstracted behind an S3-compatible interface (MinIO in development), accessed only via signed, time-limited URLs (NFR-6).
+\end{itemize}
+
+\section{Engine Availability Heuristic}
+
+A mature set of off-the-shelf components is used deliberately, so that engineering effort goes into routing correctness, accountability guarantees, and abuse resistance rather than into reinventing infrastructure.
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.28\textwidth} p{0.58\textwidth}}
+\toprule
+Layer & Choice \\
+\midrule
+Frontend & React + Tailwind \\
+Maps & Leaflet + OpenStreetMap \\
+Backend / API & Python + FastAPI \\
+Queue & Redis + Celery \\
+Database & PostgreSQL + PostGIS \\
+Cache & Redis \\
+Object storage & S3-compatible / MinIO (development) \\
+LLM / Vision & Claude or GPT-4 vision-capable API \\
+Notifications & Twilio (SMS), SendGrid (email) \\
+Auth & JWT (OAuth2 password flow via FastAPI) \\
+Deployment & Docker Compose (local) $\rightarrow$ Render/Railway (demo) \\
+CI/CD & GitHub Actions \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Project Scope and Deliverables --- Iteration-Friendly}
+
+\subsection{Initial Deliverable (v1 Scope)}
+
+\begin{itemize}
+    \item Citizen registration/login via phone number + OTP, and complaint submission via live camera capture + auto-captured GPS, with an optional free-text note (FR-C1--C3).
+    \item Immediate complaint ID and estimated SLA deadline on submission, ahead of async AI processing (FR-C4).
+    \item Async CV/LLM classification (category, severity, confidence) with a low-confidence review queue for officials (FR-AI1, FR-AI2, FR-O2).
+    \item PostGIS ward resolution and configurable category $\times$ ward $\rightarrow$ department routing, load-balanced across officials (FR-L1--L4).
+    \item Official queue sorted by SLA urgency; assignment, status updates, and mandatory photo + notes proof on Resolved (FR-O1, FR-O3, FR-O4).
+    \item Immutable, hash-chained audit log of every status change (FR-O5, NFR-8).
+    \item Citizen-facing live status timeline, SMS/email notifications on every status change, and confirm/dispute actions (FR-C5--C7).
+    \item SLA scheduler with automatic escalation to a supervisor on breach (FR-S1--S3).
+    \item Core anti-abuse layer: trust scoring, rate limiting, duplicate detection, and cluster flagging (FR-T1--T6).
+    \item Admin configuration of wards, departments, category $\rightarrow$ department mappings, and SLA rules, plus department performance dashboards (FR-A1--A3).
+    \item CI: build, backend tests, and linting; CD to a staging deployment.
+\end{itemize}
+
+\subsection{Subsequent Deliverables (Future Enhancements)}
+
+\begin{itemize}
+    \item Regional-language complaint drafting and citizen-facing translation.
+    \item Native mobile apps with offline-first sync.
+    \item Field-worker dispatch optimization (v1 keeps this manual, assigned by officials).
+    \item A public API for journalists/RTI use of aggregate accountability data.
+    \item Migration of the hash-chained audit log to a verifiable, exportable audit format.
+\end{itemize}
+
+\section{Team Roles}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.22\textwidth} p{0.66\textwidth}}
+\toprule
+Person & Responsibility \\
+\midrule
+A & Backend API, PostGIS schema, ward/department routing, SLA scheduler. \\
+B & Frontend---citizen upload flow, admin dashboard, map views. \\
+C & CV/LLM worker pipeline, prompt design, guardrails, queue integration, deployment. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Risks and Mitigations}
+
+\begin{itemize}
+    \item \textbf{Abuse and spam at scale:} An open submission flow is vulnerable to spam or coordinated flooding. This is mitigated structurally: reports only become SLA-counted verified complaints after confirmation/field verification, trust scores weight account history, and rate limiting plus clustering detection flag suspicious activity for admin review instead of requiring manual moderation to scale (FR-T1--T6, FR-A4, G3).
+
+    \item \textbf{LLM classifier unreliability:} Vision/LLM misclassification or prompt injection via photographed text/signage is mitigated by a configurable confidence threshold that routes uncertain cases to an official review queue, strict grounding of drafted descriptions in structured output only, and an explicit instruction treating in-photo text as descriptive content only, never as instructions (FR-AI2--AI4).
+
+    \item \textbf{LLM API cost and availability:} Usage is rate-limited/budgeted and the third-party API can be unavailable. Mitigations include rate-limiting the submission endpoint (NFR-7), retrying failed jobs with exponential backoff before falling back to human review (NFR-3), and queuing/retrying rather than rejecting submissions if the API is down (NFR-10).
+
+    \item \textbf{Data privacy / consent:} Citizen PII and photo data must be handled carefully. Mitigation includes aligning handling with India's DPDP Act 2023, never exposing PII on the public dashboard (NFR-9), and serving photos only via signed, time-limited URLs from a non-public bucket (NFR-6).
+
+    \item \textbf{Partial-state / integrity failures:} A crash mid-update could leave a complaint's status and audit log inconsistent, or allow tampering with history. This is mitigated by writing status updates and audit-log entries in the same DB transaction (NFR-4) and hash-chaining the status history (NFR-8).
+
+    \item \textbf{Official adoption and manual-step friction:} Officials must confirm low-confidence classifications and manually assign field workers. Mitigation includes keeping the official queue sorted by SLA urgency and separating the low-confidence review queue from the main queue, so manual effort is targeted only where the AI is uncertain (FR-O1, FR-O2).
+
+    \item \textbf{Operational issues in the pilot:} Single-city/ward scope, approximated boundary data, and a fixed 12--14 week timeline constrain what can be validated. Mitigation includes scoping v1 tightly (see Section~\ref{sec:assumptions}) and deferring multi-city/multi-language support to future work, while using CI/CD to keep staging deployable throughout.
+\end{itemize}
+
+\section{Assumptions \& Constraints}
+\label{sec:assumptions}
+
+\begin{itemize}
+    \item Pilot scope is limited to one city (or a representative subset of wards) with available or approximated boundary data.
+    \item LLM API usage is rate-limited/budgeted; the system must degrade gracefully (queue + retry) rather than fail hard under quota limits.
+    \item Officials are provisioned by admin; there is no public self-registration for the official role.
+    \item The course-project timeline (approximately 12--14 weeks) constrains scope to a single pilot city and the core feature set in Section~9.1; multi-city and multi-language support are noted as future work.
+\end{itemize}
+
+\section{Summary}
+
+This report describes CivicLens, a deployable civic complaint routing and accountability platform for a single pilot city. It replaces discretionary, poorly-routed government reporting with a system where correct department routing is geofenced and automatic, complaint deadlines are structurally enforced and auto-escalated on breach, and every action is logged in a tamper-evident audit trail.
+
+The system resists spam and coordinated abuse through trust scoring, rate limiting, and clustering detection rather than manual moderation. It is built on a production-shaped, horizontally scalable architecture using asynchronous queue-based AI/CV processing, PostGIS geospatial routing, and role-based, transactionally-consistent data handling, while remaining completable by a citizen in under 60 seconds end-to-end.
+
+\end{document}
