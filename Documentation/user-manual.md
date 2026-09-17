@@ -4,7 +4,7 @@ Welcome to the **CivicLens** User Manual. This guide walks citizens and evaluato
 
 > **Evaluation Transparency Notice**:  
 > In accordance with software engineering evaluation standards, this manual clearly distinguishes between **live captured screens** from runtime devices versus **screens described from verified source code** (owing to native mobile sensor requirements like hardware cameras and GPS modules):
-> - **Live Screenshot**: [Home Screen](#1-home-screen--dashboard-overview) (`docs/assets/screenshots/home_screen.jpg`)
+> - **Live Screenshot**: [Home Screen](#1-home-screen--dashboard-overview) (`Documentation/assets/screenshots/home_screen.jpg`)
 > - **Described from Source Code**: [Submit Complaint Screen](#2-reporting-an-issue-submitcomplaintscreen), [Complaint Detail Screen](#3-tracking-complaint-progress-complaintdetailscreen), [My Complaints Screen](#4-viewing-complaint-history-mycomplaintsscreen), and [Lightweight Status Screen](#5-lightweight-status-screen-statusscreen).
 
 ---
