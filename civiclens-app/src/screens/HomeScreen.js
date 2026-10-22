@@ -2,75 +2,113 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
-  TouchableOpacity,
   StyleSheet,
+  TouchableOpacity,
+  ActivityIndicator,
+  Image,
   StatusBar,
+  ScrollView,
+  RefreshControl,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { supabase } from '../lib/supabase';
 import { Colors, Shadows, Radius, FontSize, Spacing } from '../constants/design';
 
+const STATUS_CONFIG = {
+  Submitted:       { color: '#6366F1', icon: '📝', label: 'Submitted' },
+  Processing:      { color: '#8B5CF6', icon: '⚙️', label: 'AI Processing' },
+  'Low-Confidence':{ color: '#D97706', icon: '⚠️', label: 'Human Review' },
+  Assigned:        { color: '#0284C7', icon: '👤', label: 'Assigned' },
+  'In Progress':   { color: '#2563EB', icon: '🔧', label: 'In Progress' },
+  Resolved:        { color: '#059669', icon: '✅', label: 'Resolved' },
+  Closed:          { color: '#64748B', icon: '🔒', label: 'Closed' },
+  Reopened:        { color: '#DC2626', icon: '🔄', label: 'Reopened' },
+  Escalated:       { color: '#DC2626', icon: '🚨', label: 'Escalated' },
+};
+
 export default function HomeScreen({ navigation }) {
-  const [stats, setStats] = useState({
-    submitted: 0,
-    inProgress: 0,
-    resolved: 0,
-    needsReview: 0,
-  });
+  const [displayName, setDisplayName] = useState('');
+  const [lastComplaint, setLastComplaint] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const fetchStats = useCallback(async () => {
+  const fetchData = useCallback(async () => {
     try {
-      const { data, error } = await supabase
+      const { data: { session } } = await supabase.auth.getSession();
+      const userId = session?.user?.id;
+      if (!userId) {
+        setLoading(false);
+        return;
+      }
+
+      // Get display name
+      const { data: userData } = await supabase
+        .from('users')
+        .select('display_name')
+        .eq('id', userId)
+        .single();
+
+      setDisplayName(
+        userData?.display_name || session.user.email?.split('@')[0] || 'Citizen'
+      );
+
+      // Get last complaint
+      const { data: complaints } = await supabase
         .from('complaints')
-        .select('status');
+        .select('id, category, status, photo_url, ai_description, created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1);
 
-      if (!error && data) {
-        let submitted = 0;
-        let inProgress = 0;
-        let resolved = 0;
-        let needsReview = 0;
-
-        data.forEach((item) => {
-          const s = item.status;
-          if (s === 'Submitted' || s === 'Processing' || s === 'Low-Confidence') {
-            // Citizen submitted complaints in intake or awaiting verification
-            submitted++;
-            if (s === 'Low-Confidence') {
-              needsReview++;
-            }
-          } else if (['Assigned', 'In Progress', 'Escalated', 'Reopened'].includes(s)) {
-            // Only verified civic complaints dispatched to field crews
-            inProgress++;
-          } else if (['Resolved', 'Closed'].includes(s)) {
-            resolved++;
-          }
-        });
-
-        setStats({ submitted, inProgress, resolved, needsReview });
+      if (complaints && complaints.length > 0) {
+        setLastComplaint(complaints[0]);
       }
     } catch (err) {
-      console.warn('Failed to load complaint stats:', err);
+      console.warn('HomeScreen fetch error:', err);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, []);
 
   useEffect(() => {
-    fetchStats();
-  }, [fetchStats]);
-
-  // Refresh counts when navigating back to Home
-  useEffect(() => {
     const unsubscribe = navigation.addListener('focus', () => {
-      fetchStats();
+      fetchData();
     });
     return unsubscribe;
-  }, [navigation, fetchStats]);
+  }, [navigation, fetchData]);
+
+  const onRefresh = () => {
+    setRefreshing(true);
+    fetchData();
+  };
+
+  const timeAgo = (dateStr) => {
+    if (!dateStr) return '';
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+  };
+
+  const statusCfg = lastComplaint
+    ? STATUS_CONFIG[lastComplaint.status] || { color: '#64748B', icon: '❓', label: lastComplaint.status }
+    : null;
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="dark-content" backgroundColor={Colors.bg} />
-      <View style={styles.container}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[Colors.primary]} />
+        }
+      >
         {/* Header */}
         <View style={styles.header}>
           <Text style={styles.brand}>🏛️ CivicLens</Text>
@@ -79,84 +117,89 @@ export default function HomeScreen({ navigation }) {
           </Text>
         </View>
 
-        {/* Action Cards */}
-        <View style={styles.cards}>
-          {/* New Complaint */}
-          <TouchableOpacity
-            style={[styles.card, styles.cardPrimary]}
-            activeOpacity={0.85}
-            onPress={() => navigation.navigate('Submit')}
-          >
-            <View style={styles.cardIcon}>
-              <Text style={styles.cardEmoji}>📸</Text>
-            </View>
-            <Text style={styles.cardTitle}>Report an Issue</Text>
-            <Text style={styles.cardDescription}>
-              Take a photo and submit a complaint. AI classifies and routes it automatically.
-            </Text>
-            <View style={styles.cardArrow}>
-              <Text style={styles.cardArrowText}>→</Text>
-            </View>
-          </TouchableOpacity>
-
-          {/* My Complaints */}
-          <TouchableOpacity
-            style={[styles.card, styles.cardSecondary]}
-            activeOpacity={0.85}
-            onPress={() => navigation.navigate('MyComplaints')}
-          >
-            <View style={styles.cardIcon}>
-              <Text style={styles.cardEmoji}>📋</Text>
-            </View>
-            <Text style={styles.cardTitleDark}>My Complaints</Text>
-            <Text style={styles.cardDescriptionDark}>
-              View all your past reports and track their real-time status.
-            </Text>
-            <View style={styles.cardArrowDark}>
-              <Text style={styles.cardArrowTextDark}>→</Text>
-            </View>
-          </TouchableOpacity>
+        {/* Welcome */}
+        <View style={styles.welcomeSection}>
+          <Text style={styles.welcomeText}>Welcome back,</Text>
+          <Text style={styles.userName}>
+            {loading ? '...' : displayName} 👋
+          </Text>
         </View>
 
-        {/* Live Municipal Stats Bar */}
-        <TouchableOpacity
-          style={styles.statsCard}
-          activeOpacity={0.85}
-          onPress={() => navigation.navigate('MyComplaints')}
-        >
-          <View style={styles.statsBar}>
-            <View style={styles.statItem}>
-              <Text style={styles.statNumber}>
-                {loading ? '…' : stats.submitted}
-              </Text>
-              <Text style={styles.statLabel}>Submitted</Text>
-            </View>
-            <View style={styles.statDivider} />
-            <View style={styles.statItem}>
-              <Text style={[styles.statNumber, { color: Colors.primary }]}>
-                {loading ? '…' : stats.inProgress}
-              </Text>
-              <Text style={styles.statLabel}>In Progress</Text>
-            </View>
-            <View style={styles.statDivider} />
-            <View style={styles.statItem}>
-              <Text style={[styles.statNumber, { color: Colors.accent }]}>
-                {loading ? '…' : stats.resolved}
-              </Text>
-              <Text style={styles.statLabel}>Resolved</Text>
-            </View>
-          </View>
+        {/* Last Complaint */}
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Your Latest Report</Text>
+        </View>
 
-          {stats.needsReview > 0 && (
-            <View style={styles.reviewNotice}>
-              <Text style={styles.reviewNoticeIcon}>🛡️</Text>
-              <Text style={styles.reviewNoticeText}>
-                {stats.needsReview} reported item{stats.needsReview > 1 ? 's' : ''} held for human verification
+        {loading ? (
+          <View style={styles.loadingCard}>
+            <ActivityIndicator size="small" color={Colors.primary} />
+          </View>
+        ) : lastComplaint ? (
+          <TouchableOpacity
+            style={styles.complaintCard}
+            activeOpacity={0.85}
+            onPress={() => navigation.navigate('ComplaintDetail', { complaintId: lastComplaint.id })}
+          >
+            {/* Photo strip */}
+            {lastComplaint.photo_url ? (
+              <Image source={{ uri: lastComplaint.photo_url }} style={styles.complaintPhoto} />
+            ) : (
+              <View style={[styles.complaintPhoto, styles.photoPlaceholder]}>
+                <Text style={styles.photoPlaceholderText}>📷</Text>
+              </View>
+            )}
+
+            <View style={styles.complaintBody}>
+              {/* Status badge */}
+              <View style={[styles.statusBadge, { backgroundColor: statusCfg.color + '15' }]}>
+                <Text style={[styles.statusText, { color: statusCfg.color }]}>
+                  {statusCfg.icon} {statusCfg.label}
+                </Text>
+              </View>
+
+              {/* Description */}
+              <Text style={styles.complaintDesc} numberOfLines={2}>
+                {lastComplaint.ai_description || lastComplaint.category || 'Civic issue reported'}
               </Text>
+
+              {/* Meta */}
+              <View style={styles.complaintMeta}>
+                <Text style={styles.metaText}>
+                  {(lastComplaint.category || 'pending').replace(/_/g, ' ')}
+                </Text>
+                <Text style={styles.metaDot}>•</Text>
+                <Text style={styles.metaText}>{timeAgo(lastComplaint.created_at)}</Text>
+              </View>
+
+              <Text style={styles.tapHint}>Tap to view full details →</Text>
             </View>
-          )}
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyIcon}>📭</Text>
+            <Text style={styles.emptyTitle}>No reports yet</Text>
+            <Text style={styles.emptySubtitle}>
+              Submit your first civic complaint to start tracking it here.
+            </Text>
+          </View>
+        )}
+
+        {/* Report New Issue Button */}
+        <TouchableOpacity
+          style={styles.reportButton}
+          activeOpacity={0.85}
+          onPress={() => navigation.navigate('SubmitTab')}
+        >
+          <Text style={styles.reportButtonIcon}>📸</Text>
+          <View style={styles.reportButtonTextWrap}>
+            <Text style={styles.reportButtonTitle}>Report New Issue</Text>
+            <Text style={styles.reportButtonSub}>
+              Take a photo and let AI classify it instantly
+            </Text>
+          </View>
+          <Text style={styles.reportArrow}>→</Text>
         </TouchableOpacity>
-      </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -166,11 +209,16 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: Colors.bg,
   },
-  container: {
+  scroll: {
     flex: 1,
+  },
+  content: {
     padding: Spacing.xl,
     paddingTop: Spacing.xxl,
+    paddingBottom: Spacing.xxxl,
   },
+
+  // Header
   header: {
     marginBottom: Spacing.xxl,
   },
@@ -181,151 +229,168 @@ const styles = StyleSheet.create({
     letterSpacing: -0.5,
   },
   tagline: {
-    fontSize: FontSize.base,
+    fontSize: FontSize.sm,
     color: Colors.textSecondary,
     marginTop: Spacing.xs,
-    lineHeight: 22,
   },
 
-  // Cards
-  cards: {
-    gap: Spacing.base,
-    marginBottom: Spacing.xl,
+  // Welcome
+  welcomeSection: {
+    marginBottom: Spacing.xxl,
   },
-  card: {
-    borderRadius: Radius.lg,
-    padding: Spacing.xl,
-    position: 'relative',
-    overflow: 'hidden',
-    ...Shadows.medium,
-  },
-  cardPrimary: {
-    backgroundColor: Colors.primary,
-  },
-  cardSecondary: {
-    backgroundColor: Colors.white,
-    borderWidth: 1,
-    borderColor: Colors.border,
-  },
-  cardIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: Radius.md,
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: Spacing.md,
-  },
-  cardEmoji: {
-    fontSize: 22,
-  },
-  cardTitle: {
-    fontSize: FontSize.lg,
-    fontWeight: '700',
-    color: Colors.textInverse,
-    marginBottom: Spacing.xs,
-  },
-  cardTitleDark: {
-    fontSize: FontSize.lg,
-    fontWeight: '700',
-    color: Colors.textPrimary,
-    marginBottom: Spacing.xs,
-  },
-  cardDescription: {
-    fontSize: FontSize.sm,
-    color: 'rgba(255,255,255,0.85)',
-    lineHeight: 20,
-    marginBottom: Spacing.sm,
-  },
-  cardDescriptionDark: {
-    fontSize: FontSize.sm,
+  welcomeText: {
+    fontSize: FontSize.base,
     color: Colors.textSecondary,
-    lineHeight: 20,
-    marginBottom: Spacing.sm,
   },
-  cardArrow: {
-    position: 'absolute',
-    right: Spacing.xl,
-    top: Spacing.xl,
-    width: 32,
-    height: 32,
-    borderRadius: Radius.full,
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  cardArrowText: {
-    color: Colors.textInverse,
-    fontSize: FontSize.md,
-    fontWeight: '600',
-  },
-  cardArrowDark: {
-    position: 'absolute',
-    right: Spacing.xl,
-    top: Spacing.xl,
-    width: 32,
-    height: 32,
-    borderRadius: Radius.full,
-    backgroundColor: Colors.primaryLight,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  cardArrowTextDark: {
-    color: Colors.primary,
-    fontSize: FontSize.md,
-    fontWeight: '600',
-  },
-
-  // Stats
-  statsCard: {
-    backgroundColor: Colors.white,
-    borderRadius: Radius.lg,
-    padding: Spacing.lg,
-    ...Shadows.small,
-    borderWidth: 1,
-    borderColor: Colors.border,
-  },
-  statsBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  statItem: {
-    flex: 1,
-    alignItems: 'center',
-  },
-  statNumber: {
+  userName: {
     fontSize: FontSize.xl,
     fontWeight: '800',
     color: Colors.textPrimary,
-  },
-  statLabel: {
-    fontSize: FontSize.xs,
-    color: Colors.textMuted,
     marginTop: 2,
+  },
+
+  // Section
+  sectionHeader: {
+    marginBottom: Spacing.md,
+  },
+  sectionTitle: {
+    fontSize: FontSize.sm,
+    fontWeight: '700',
+    color: Colors.textMuted,
     textTransform: 'uppercase',
-    letterSpacing: 0.5,
+    letterSpacing: 0.8,
   },
-  statDivider: {
-    width: 1,
-    height: 32,
-    backgroundColor: Colors.border,
+
+  // Loading
+  loadingCard: {
+    backgroundColor: Colors.white,
+    borderRadius: Radius.lg,
+    padding: Spacing.xxxl,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginBottom: Spacing.xl,
   },
-  reviewNotice: {
+
+  // Complaint card
+  complaintCard: {
+    backgroundColor: Colors.white,
+    borderRadius: Radius.lg,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginBottom: Spacing.xl,
+    ...Shadows.medium,
+  },
+  complaintPhoto: {
+    width: '100%',
+    height: 160,
+    backgroundColor: Colors.borderLight,
+  },
+  photoPlaceholder: {
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  photoPlaceholderText: {
+    fontSize: 36,
+  },
+  complaintBody: {
+    padding: Spacing.base,
+  },
+  statusBadge: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 4,
+    borderRadius: Radius.full,
+    marginBottom: Spacing.sm,
+  },
+  statusText: {
+    fontSize: FontSize.xs,
+    fontWeight: '700',
+  },
+  complaintDesc: {
+    fontSize: FontSize.base,
+    color: Colors.textPrimary,
+    lineHeight: 22,
+    marginBottom: Spacing.sm,
+  },
+  complaintMeta: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: Spacing.md,
-    paddingTop: Spacing.sm,
-    borderTopWidth: 1,
-    borderTopColor: '#F1F5F9',
+    marginBottom: Spacing.sm,
   },
-  reviewNoticeIcon: {
-    fontSize: 12,
-    marginRight: 6,
-  },
-  reviewNoticeText: {
+  metaText: {
     fontSize: FontSize.xs,
     color: Colors.textMuted,
-    fontWeight: '500',
+    textTransform: 'capitalize',
+  },
+  metaDot: {
+    marginHorizontal: 6,
+    color: Colors.textMuted,
+    fontSize: FontSize.xs,
+  },
+  tapHint: {
+    fontSize: FontSize.xs,
+    color: Colors.primary,
+    fontWeight: '600',
+  },
+
+  // Empty state
+  emptyCard: {
+    backgroundColor: Colors.white,
+    borderRadius: Radius.lg,
+    padding: Spacing.xxl,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginBottom: Spacing.xl,
+  },
+  emptyIcon: {
+    fontSize: 40,
+    marginBottom: Spacing.md,
+  },
+  emptyTitle: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: Colors.textPrimary,
+    marginBottom: Spacing.xs,
+  },
+  emptySubtitle: {
+    fontSize: FontSize.sm,
+    color: Colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+
+  // Report button
+  reportButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: Colors.primary,
+    borderRadius: Radius.lg,
+    padding: Spacing.lg,
+    ...Shadows.medium,
+  },
+  reportButtonIcon: {
+    fontSize: 28,
+    marginRight: Spacing.md,
+  },
+  reportButtonTextWrap: {
+    flex: 1,
+  },
+  reportButtonTitle: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: Colors.white,
+  },
+  reportButtonSub: {
+    fontSize: FontSize.xs,
+    color: 'rgba(255,255,255,0.8)',
+    marginTop: 2,
+  },
+  reportArrow: {
+    fontSize: FontSize.xl,
+    color: Colors.white,
+    fontWeight: '700',
   },
 });

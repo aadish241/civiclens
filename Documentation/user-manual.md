@@ -112,13 +112,22 @@ Once submitted, the citizen lands on this tracking screen. The client uses an au
 1. **Dynamic Real-Time Update**:
    While the status is `Submitted` or `Processing`, a subtle spinner indicates that the autonomous AI daemon is inspecting the image. Within 2 to 4 seconds, the screen transitions dynamically to `Assigned` without requiring a manual refresh.
 2. **Human Triage Notice (`Low-Confidence`)**:
-   If a user submits an irrelevant photo (e.g., an indoor keyboard, pet, or selfie) or an image with confidence score $< 0.60$, the AI flags it (`is_civic_issue: false`). The status banner shifts to amber with an alert:
+   If a user submits an irrelevant photo (e.g., an indoor keyboard, pet, or selfie) or an image with confidence score $< 0.70$, the AI flags it (`is_civic_issue: false`). The status banner shifts to amber with an alert:
    > ⚠️ **Low-Confidence — Under Review**  
    > *"Flagged as private space or non-civic item. In triage queue for human verification."*  
-   This ensures transparency while preventing false municipal dispatches.
-3. **Official SLA Clock (FR-S1)**:
-   Displays the computed resolution deadline based on the municipal SLA matrix (e.g., 24 hours for High Severity Potholes, 120 hours for Low Severity Garbage).
-4. **Immutable Audit Trail (FR-O5 / NFR-8)**:
+3. **Official SLA Clock (FR-S1) & Escalation (FR-S2)**:
+   Displays the computed resolution deadline based on the municipal SLA matrix. If the deadline expires while the ticket is active, the background SLA daemon auto-escalates the ticket to `🚨 SLA Escalated`, flagging the municipal supervisor.
+4. **Official Resolution Proof Card (FR-O4)**:
+   When an official marks the ticket `Resolved`, a dedicated green card displays:
+   - Official proof photo of the repaired site with a `📸 Official Proof Photo` badge.
+   - Engineering repair notes explaining the work performed.
+   - Exact resolution timestamp.
+5. **Citizen Verification & Dispute Loop (FR-C7)**:
+   Directly below the official resolution card, the citizen is presented with two actionable choices:
+   - **Confirm Resolution ✅**: Prompts a confirmation dialog and transitions the complaint to `Closed & Confirmed` 🎉.
+   - **Dispute Work ❌**: Opens a modal where the citizen provides a mandatory reason (e.g. *"Patch uneven, gravel loose"*) and can snap a fresh camera proof photo. Submitting transitions the status back to `🔄 Reopened by Citizen`, returning it to the supervisor queue.
+   - **7-Day Auto-Closure Reminder**: Explains that if no citizen response occurs within 7 days, the ticket is safely auto-closed by the background engine.
+6. **Immutable Audit Trail (FR-O5 / NFR-8)**:
    Shows every event in the ticket's history with timestamps, actor role (`citizen`, `system`, `official`), and verification notes.
 
 ---
@@ -127,30 +136,29 @@ Once submitted, the citizen lands on this tracking screen. The client uses an au
 
 *(Described from source code: [`civiclens-app/src/screens/MyComplaintsScreen.js`](../civiclens-app/src/screens/MyComplaintsScreen.js))*
 
-Citizens can review all their historical complaints in a unified feed accessible from the Home Screen card.
-
-### Screen Features:
-- **Card Feed**: Each complaint card displays:
-  - Defect thumbnail preview.
-  - Category tag and emoji (e.g., `🕳️ Pothole`, `🗑️ Garbage`, `💡 Streetlight`).
-  - Status pill with color-coded styling (`Submitted`, `Processing`, `Assigned`, `In Progress`, `Resolved`, `Escalated`).
-  - Relative timestamp (e.g., *"Just now"*, *"12m ago"*, *"2d ago"*).
-  - Truncated citizen description note.
-- **Pull-to-Refresh**: Citizens can pull down on the list to trigger `fetchComplaints()` and retrieve latest status changes from the cloud.
-- **Detailed Drilldown**: Tapping any card opens `ComplaintDetailScreen` for full lifecycle inspection.
+Citizens can review all their historical complaints in a unified feed accessible from the bottom navigation tab bar:
+- **Card Feed**: Each complaint card displays defect thumbnail preview, category emoji, status pill (`Submitted`, `Processing`, `Assigned`, `In Progress`, `Resolved`, `Escalated`, `Closed`, `Reopened`), relative timestamp, and citizen description note.
+- **Pull-to-Refresh**: Citizens can pull down to refresh ticket state directly from Supabase.
+- **Detailed Drilldown**: Tapping any card opens `ComplaintDetailScreen`.
 
 ---
 
-## 5. Lightweight Status Screen (`StatusScreen`)
+## 5. Neighbourhood Community Feed (`NeighbourhoodScreen`)
 
-*(Described from source code: [`civiclens-app/src/screens/StatusScreen.js`](../civiclens-app/src/screens/StatusScreen.js))*
+*(Described from source code: [`civiclens-app/src/screens/NeighbourhoodScreen.js`](../civiclens-app/src/screens/NeighbourhoodScreen.js))*
 
-A minimalist status tracker designed for quick lookup via direct complaint ID routing:
-- Displays Complaint UUID and original photo.
-- Displays a vertical 5-step milestone timeline:
-  1. `Submitted`
-  2. `Assigned`
-  3. `In Progress`
-  4. `Resolved`
-  5. `Closed`
-- Supports pull-to-refresh to verify current state.
+The **Neighbourhood** tab empowers hyper-local community transparency and collective prioritization:
+- **5km Geofenced Proximity Filtering**: Samples device GPS coordinates and uses the mathematical Haversine formula to filter out distant tickets, showing only actionable civic defects within a 5.0 km radius.
+- **Distance Badges**: Every card shows calculated distance (e.g. `0.4 km away`, `1.8 km away`).
+- **Anonymity & Privacy (DPDP Compliance)**: Zero citizen personal data (name, phone, email) is rendered on public cards.
+- **Atomic Upvoting**: Citizens can tap the upvote heart button on local issues to increment community priority. A PostgreSQL trigger synchronizes counts in real time. Tapping again retracts the vote.
+
+---
+
+## 6. Citizen Authentication & Onboarding
+
+*(Described from source code: [`civiclens-app/src/context/AuthContext.js`](../civiclens-app/src/context/AuthContext.js))*
+
+- **8-Digit Email OTP Login & Signup**: Low-friction passwordless sign-in powered by Supabase Auth OTP.
+- **Automated Anti-Race State Machine**: A 3-step registration flow verifies the token and creates the user profile with default trust scores while preventing navigation glitches.
+- **Profile Screen**: Displays citizen display name, registered email, account trust score (FR-T2), and a secure sign-out action.

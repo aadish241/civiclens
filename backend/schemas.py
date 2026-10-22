@@ -59,6 +59,10 @@ class ComplaintDetail(BaseModel):
     department_id: Optional[str] = None
     assigned_to: Optional[str] = None
     sla_deadline: Optional[str] = None
+    resolved_at: Optional[str] = None
+    closed_at: Optional[str] = None
+    resolution_photo_url: Optional[str] = None
+    resolution_notes: Optional[str] = None
     created_at: str
     updated_at: Optional[str] = None
 
@@ -66,6 +70,26 @@ class ComplaintDetail(BaseModel):
     ward_name: Optional[str] = None
     department_name: Optional[str] = None
     official_name: Optional[str] = None
+
+
+class ConfirmResolutionRequest(BaseModel):
+    notes: Optional[str] = None
+
+
+class DisputeResolutionRequest(BaseModel):
+    reason: str = Field(..., min_length=2, description="Reason for disputing resolution")
+    dispute_photo_url: Optional[str] = None
+
+
+class OfficialResolveRequest(BaseModel):
+    resolution_notes: str = Field(..., min_length=2, description="Official notes describing the work done")
+    resolution_photo_url: Optional[str] = None
+
+
+class ResolutionActionResponse(BaseModel):
+    id: str
+    status: str
+    message: str
 
 
 class ComplaintListItem(BaseModel):

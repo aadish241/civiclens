@@ -13,11 +13,12 @@ By leveraging **Multimodal Vision AI (Google Gemini)** and **PostgreSQL PostGIS 
 
 ## 🚀 Key Features
 
-- **📸 Instant Citizen Reporting**:
-  - React Native / Expo cross-platform mobile client (iOS & Android).
-  - High-speed camera capture and hardware GPS coordinate extraction.
+- **📸 Instant Citizen Reporting & Authentication**:
+  - React Native / Expo cross-platform mobile client (iOS & Android) with Instagram-style 5-tab interface.
+  - 8-digit email-based OTP passwordless authentication flow with anti-race state machine.
+  - High-speed live hardware camera capture and hardware GPS coordinate extraction (gallery uploads blocked).
   - Direct-to-cloud upload to Supabase Cloud Storage (`< 1s` submission time).
-  - Real-time Home Screen metrics tracker (*Submitted*, *In Progress*, *Resolved*).
+  - Dynamic Home Screen with personalized greetings and live municipal status metrics.
 
 - **🧠 Multimodal AI Vision Engine**:
   - Powered by Google Gemini Vision (`gemini-3.1-flash-lite`, `gemini-3.6-flash`, `gemini-3.5-flash`).
@@ -25,6 +26,7 @@ By leveraging **Multimodal Vision AI (Google Gemini)** and **PostgreSQL PostGIS 
   - Severity assessment: `low`, `medium`, `high`.
   - Generates formal municipal engineering notes and public hazard assessments.
   - Automatic non-civic/spam filtering (`is_civic_issue: false`).
+  - Prompt-injection guardrail explicitly ignoring text/signage in defect imagery.
   - Multi-model fallback chain for 99.9% uptime against rate limits and 503 spikes.
 
 - **🗺️ PostGIS Geospatial Ward Routing**:
@@ -32,11 +34,27 @@ By leveraging **Multimodal Vision AI (Google Gemini)** and **PostgreSQL PostGIS 
   - Boundary buffer fallback (`ST_DWithin` with 500m radius) for borderline GPS points.
   - Category $\to$ Department lookup matrix with ward-specific routing overrides.
 
-- **⏱️ Dynamic SLA & Ticket Lifecycle**:
-  - Configurable SLA deadlines per category and severity matrix.
-  - **Human-in-the-Loop Triage**: Tickets with confidence score $< 0.70$ or non-civic flags are marked `Low-Confidence` for manual supervisor review.
-  - Transparent status progression: `Submitted` $\to$ `Processing` $\to$ `Assigned` $\to$ `In Progress` $\to$ `Resolved`.
-  - Immutable audit trail (`audit_logs`) tracking every status change, AI score, and official assignment.
+- **⏱️ Step 1: SLA Escalation Engine (Autonomous Scheduler)**:
+  - Dynamic SLA deadlines computed per category and severity.
+  - Background daemon scanning every 60s for expired SLAs.
+  - Overdue tickets auto-escalate to `🚨 SLA Escalated`, alerting department supervisors.
+  - Immutable audit trail (`audit_logs`) tracking exact overdue hours and system actions.
+
+- **⚖️ Step 2: Citizen Confirmation & Dispute Loop (FR-C7 / FR-O4)**:
+  - Official resolution proof card displaying official proof photo, remarks, and completion timestamp.
+  - Citizen **Confirm Resolution ✅** action: verifies repair and transitions ticket to `Closed & Confirmed`.
+  - Citizen **Dispute Work ❌** action: modal with mandatory explanation and optional camera proof photo transitions ticket back to `Reopened`.
+  - **7-Day Auto-Closure Engine**: Automatically closes tickets left in `Resolved` for 7 days without citizen action.
+
+- **📍 Hyperlocal 5km Geofenced Feed & Upvoting**:
+  - Neighbourhood tab filtering tickets within 5.0 km using the Haversine formula.
+  - Distance badges (`0.8 km away`) showing defect proximity.
+  - Anonymous public cards (DPDP Act privacy compliant: no user names, emails, or phone numbers).
+  - Atomic upvoting with database trigger synchronization preventing race conditions.
+
+---
+
+> 📖 **Evaluation & Viva Defense Guide**: For detailed system walkthroughs, viva questions, and architectural explanations, see [**Documentation/evaluation-defense-guide.md**](Documentation/evaluation-defense-guide.md).
 
 ---
 
@@ -168,6 +186,20 @@ civiclens/
 - **Row-Level Security (RLS)**: Enforced across PostgreSQL tables.
 - **Recursion-Free Admin Checks**: Uses a `SECURITY DEFINER` function `is_admin()` to avoid RLS circular evaluation.
 - **Immutable Audit Trail**: Append-only log for every state transition and system action.
+
+---
+
+## 🗺️ Project Development Roadmap
+
+| Phase | Milestone / Feature | Status |
+|---|---|:---:|
+| **Step 1** | **SLA Escalation Engine** (Autonomous 60s Background Poller, Auto-Escalation, Audit Trail) | ✅ Completed |
+| **Step 2** | **Citizen Confirmation & Dispute Loop** (FR-C7 / FR-O4, Proof Photo, 7-Day Auto-Close) | ✅ Completed |
+| **Neighbourhood** | **5km Geofenced Feed & Atomic Upvotes** (Haversine Filter, Anonymous Cards, Trigger Sync) | ✅ Completed |
+| **Step 3** | **Municipal Officer Web Portal** (React Dashboard for Triage, Field Assignment, and Resolution) | ⏳ In Progress |
+| **Step 4** | **Push Notifications** (Real-time updates on ticket assignment, escalation, and resolution) | 📋 Planned |
+| **Step 5** | **Admin Analytics & Spatial Heatmaps** (Department SLA Compliance, Ward Ranking, Public Map) | 📋 Planned |
+| **Step 6** | **AI Duplicate Detection Engine** (Perceptual Image Hashing `pHash` + Proximity Clustering) | 📋 Planned |
 
 ---
 

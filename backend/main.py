@@ -26,6 +26,10 @@ from config import get_settings
 from database import supabase_admin
 from ai_service import analyze_complaint_image
 from routing_service import route_and_assign_complaint
+from sla_scheduler import (
+    check_and_escalate_sla_breaches,
+    check_and_autoclose_resolved_complaints,
+)
 from schemas import (
     ComplaintSubmitResponse,
     ComplaintDetail,
@@ -34,6 +38,10 @@ from schemas import (
     AuditLogEntry,
     HeatmapPoint,
     HealthResponse,
+    ConfirmResolutionRequest,
+    DisputeResolutionRequest,
+    OfficialResolveRequest,
+    ResolutionActionResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -143,15 +151,43 @@ async def poll_unprocessed_complaints():
         await asyncio.sleep(3)
 
 
+async def poll_sla_escalations():
+    """
+    Background worker that checks for SLA breaches every 60 seconds.
+    Runs alongside the AI classification poller.
+    """
+    logger.info("SLA escalation scheduler started — checking every 60s for overdue complaints...")
+    # Initial delay to let the server start up cleanly
+    await asyncio.sleep(10)
+    while True:
+        try:
+            count = await check_and_escalate_sla_breaches()
+            if count > 0:
+                logger.info(f"[SLA Scheduler] Escalated {count} complaint(s) this cycle.")
+
+            closed = await check_and_autoclose_resolved_complaints(days_threshold=7)
+            if closed > 0:
+                logger.info(f"[Auto-Close] Auto-closed {closed} complaint(s) after 7 days in Resolved.")
+        except Exception as err:
+            logger.error(f"[SLA/Auto-Close Scheduler] Error: {err}")
+        await asyncio.sleep(60)  # Check every 60 seconds
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    worker_task = asyncio.create_task(poll_unprocessed_complaints())
+    ai_worker = asyncio.create_task(poll_unprocessed_complaints())
+    sla_worker = asyncio.create_task(poll_sla_escalations())
     try:
         yield
     finally:
-        worker_task.cancel()
+        ai_worker.cancel()
+        sla_worker.cancel()
         try:
-            await worker_task
+            await ai_worker
+        except asyncio.CancelledError:
+            pass
+        try:
+            await sla_worker
         except asyncio.CancelledError:
             pass
 
@@ -464,6 +500,10 @@ async def get_complaint_detail(complaint_id: str):
         department_id=complaint.get("department_id"),
         assigned_to=complaint.get("assigned_to"),
         sla_deadline=str(complaint["sla_deadline"]) if complaint.get("sla_deadline") else None,
+        resolved_at=str(complaint["resolved_at"]) if complaint.get("resolved_at") else None,
+        closed_at=str(complaint["closed_at"]) if complaint.get("closed_at") else None,
+        resolution_photo_url=complaint.get("resolution_photo_url"),
+        resolution_notes=complaint.get("resolution_notes"),
         created_at=complaint["created_at"],
         updated_at=complaint.get("updated_at"),
         ward_name=ward_name,
@@ -509,6 +549,255 @@ async def classify_complaint_endpoint(complaint_id: str):
         longitude=c.get("longitude"),
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# POST /api/sla/check — Manually trigger SLA escalation scan
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/sla/check",
+    tags=["System"],
+    summary="Manually trigger SLA breach check and escalation",
+)
+async def manual_sla_check():
+    """
+    On-demand SLA breach scanner. Useful for testing or admin-triggered checks.
+    The background worker already runs this every 60 seconds automatically.
+    """
+    count = await check_and_escalate_sla_breaches()
+    return {
+        "escalated_count": count,
+        "message": f"SLA check complete. {count} complaint(s) escalated." if count else "No SLA breaches found.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/complaints/{id}/confirm — Citizen confirms resolution (FR-C7)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/complaints/{complaint_id}/confirm",
+    response_model=ResolutionActionResponse,
+    tags=["Citizen Resolution Loop"],
+    summary="Citizen confirms issue resolution (FR-C7: Resolved -> Closed)",
+)
+async def confirm_resolution(
+    complaint_id: str,
+    body: Optional[ConfirmResolutionRequest] = None,
+):
+    """
+    FR-C7: Citizen confirms that the reported issue has been satisfactorily resolved.
+    Transitions complaint status from 'Resolved' to 'Closed' and records an audit log entry.
+    """
+    res = (
+        supabase_admin.table("complaints")
+        .select("id, status")
+        .eq("id", complaint_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Complaint not found")
+
+    complaint = res.data[0]
+    if complaint["status"] != "Resolved":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only complaints in 'Resolved' status can be confirmed (current: '{complaint['status']}').",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    supabase_admin.table("complaints").update({
+        "status": "Closed",
+        "closed_at": now_iso,
+    }).eq("id", complaint_id).execute()
+
+    notes = (body.notes.strip() if body and body.notes else "") or "Citizen confirmed resolution. Ticket closed."
+    audit_entry = {
+        "complaint_id": complaint_id,
+        "actor_role": "citizen",
+        "action": "citizen_confirmed",
+        "old_value": "Resolved",
+        "new_value": "Closed",
+        "notes": notes,
+    }
+    supabase_admin.table("audit_logs").insert(audit_entry).execute()
+
+    logger.info(f"Complaint {complaint_id} confirmed by citizen -> Closed")
+    return ResolutionActionResponse(
+        id=complaint_id,
+        status="Closed",
+        message="Resolution confirmed successfully. Complaint is now Closed.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/complaints/{id}/dispute — Citizen disputes resolution (FR-C7)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/complaints/{complaint_id}/dispute",
+    response_model=ResolutionActionResponse,
+    tags=["Citizen Resolution Loop"],
+    summary="Citizen disputes resolution (FR-C7: Resolved -> Reopened)",
+)
+async def dispute_resolution(
+    complaint_id: str,
+    reason: str = Form(..., description="Explanation of why the issue is still unresolved"),
+    photo: Optional[UploadFile] = File(None, description="Optional photo proof of unresolved issue"),
+):
+    """
+    FR-C7: Citizen disputes that the issue was resolved (e.g. work incomplete or sub-par).
+    Transitions complaint status from 'Resolved' to 'Reopened' and logs the citizen's dispute notes and proof photo.
+    """
+    res = (
+        supabase_admin.table("complaints")
+        .select("id, status")
+        .eq("id", complaint_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Complaint not found")
+
+    complaint = res.data[0]
+    if complaint["status"] != "Resolved":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only complaints in 'Resolved' status can be disputed (current: '{complaint['status']}').",
+        )
+
+    dispute_photo_url = None
+    if photo:
+        try:
+            photo_bytes = await photo.read()
+            ext = photo.filename.split(".")[-1] if photo.filename else "jpg"
+            file_name = f"dispute-{uuid.uuid4().hex}.{ext}"
+            supabase_admin.storage.from_("complaint-photos").upload(
+                path=file_name,
+                file=photo_bytes,
+                file_options={"content-type": photo.content_type or "image/jpeg"},
+            )
+            dispute_photo_url = supabase_admin.storage.from_("complaint-photos").get_public_url(file_name)
+        except Exception as e:
+            logger.warning(f"Could not upload dispute photo: {e}")
+
+    # Reopen ticket
+    supabase_admin.table("complaints").update({
+        "status": "Reopened",
+    }).eq("id", complaint_id).execute()
+
+    notes_str = f"Citizen disputed resolution: {reason.strip()}"
+    if dispute_photo_url:
+        notes_str += f" | Proof photo: {dispute_photo_url}"
+
+    audit_entry = {
+        "complaint_id": complaint_id,
+        "actor_role": "citizen",
+        "action": "citizen_disputed",
+        "old_value": "Resolved",
+        "new_value": "Reopened",
+        "notes": notes_str,
+    }
+    supabase_admin.table("audit_logs").insert(audit_entry).execute()
+
+    logger.info(f"Complaint {complaint_id} disputed by citizen -> Reopened")
+    return ResolutionActionResponse(
+        id=complaint_id,
+        status="Reopened",
+        message="Resolution disputed. Complaint has been reopened and returned to the department queue.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/complaints/{id}/resolve — Official marks complaint Resolved (FR-O4)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/complaints/{complaint_id}/resolve",
+    response_model=ResolutionActionResponse,
+    tags=["Official Actions"],
+    summary="Mark complaint as Resolved (FR-O4: Official attaches proof & notes)",
+)
+async def resolve_complaint(
+    complaint_id: str,
+    resolution_notes: str = Form(..., description="Details of the repair or work performed"),
+    resolution_photo: Optional[UploadFile] = File(None, description="Official proof photo of completed work"),
+):
+    """
+    FR-O4: Official marks complaint as Resolved with mandatory notes and optional proof photo.
+    This opens the 7-day citizen confirmation / dispute window (FR-C7).
+    """
+    res = (
+        supabase_admin.table("complaints")
+        .select("id, status")
+        .eq("id", complaint_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Complaint not found")
+
+    complaint = res.data[0]
+    old_status = complaint["status"]
+
+    resolution_photo_url = None
+    if resolution_photo:
+        try:
+            photo_bytes = await resolution_photo.read()
+            ext = resolution_photo.filename.split(".")[-1] if resolution_photo.filename else "jpg"
+            file_name = f"resolution-{uuid.uuid4().hex}.{ext}"
+            supabase_admin.storage.from_("complaint-photos").upload(
+                path=file_name,
+                file=photo_bytes,
+                file_options={"content-type": resolution_photo.content_type or "image/jpeg"},
+            )
+            resolution_photo_url = supabase_admin.storage.from_("complaint-photos").get_public_url(file_name)
+        except Exception as e:
+            logger.warning(f"Could not upload resolution photo: {e}")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_payload = {
+        "status": "Resolved",
+        "resolved_at": now_iso,
+        "resolution_notes": resolution_notes.strip(),
+    }
+    if resolution_photo_url:
+        update_payload["resolution_photo_url"] = resolution_photo_url
+
+    supabase_admin.table("complaints").update(update_payload).eq("id", complaint_id).execute()
+
+    audit_entry = {
+        "complaint_id": complaint_id,
+        "actor_role": "official",
+        "action": "official_resolved",
+        "old_value": old_status,
+        "new_value": "Resolved",
+        "notes": f"Work completed: {resolution_notes.strip()}" + (f" | Proof: {resolution_photo_url}" if resolution_photo_url else ""),
+    }
+    supabase_admin.table("audit_logs").insert(audit_entry).execute()
+
+    logger.info(f"Complaint {complaint_id} marked Resolved by official (was '{old_status}')")
+    return ResolutionActionResponse(
+        id=complaint_id,
+        status="Resolved",
+        message="Complaint marked as Resolved. Citizen confirmation window is now active.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/sla/auto-close — Trigger auto-close check for Resolved complaints
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/sla/auto-close",
+    tags=["System"],
+    summary="Trigger auto-close check for Resolved complaints older than 7 days",
+)
+async def manual_auto_close_check(days: int = Query(7, ge=1, le=30)):
+    count = await check_and_autoclose_resolved_complaints(days_threshold=days)
+    return {
+        "closed_count": count,
+        "message": f"{count} complaint(s) auto-closed after {days} days in Resolved." if count else "No stale resolved complaints found.",
+    }
 
 
 # ---------------------------------------------------------------------------

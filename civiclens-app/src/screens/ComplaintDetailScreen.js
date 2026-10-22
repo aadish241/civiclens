@@ -11,10 +11,20 @@ import {
   TouchableOpacity,
   Alert,
   Platform,
+  Modal,
+  TextInput,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../lib/supabase';
-import { fetchComplaintDetail, triggerAiClassification } from '../lib/api';
+import {
+  fetchComplaintDetail,
+  triggerAiClassification,
+  confirmComplaintResolution,
+  disputeComplaintResolution,
+  resolveComplaintByOfficial,
+} from '../lib/api';
 import { Colors, Shadows, Radius, FontSize, Spacing } from '../constants/design';
 
 const LIFECYCLE_STEPS = [
@@ -31,9 +41,9 @@ const STATUS_CONFIG = {
   'Low-Confidence': { color: '#D97706', icon: '⚠️', label: 'Needs Human Review' },
   Assigned: { color: '#0284C7', icon: '👤', label: 'Assigned to Ward' },
   'In Progress': { color: '#2563EB', icon: '🔧', label: 'Work In Progress' },
-  Resolved: { color: '#059669', icon: '✅', label: 'Resolved' },
-  Closed: { color: '#64748B', icon: '🔒', label: 'Closed' },
-  Reopened: { color: '#DC2626', icon: '🔄', label: 'Reopened' },
+  Resolved: { color: '#059669', icon: '✅', label: 'Resolved (Pending Verification)' },
+  Closed: { color: '#64748B', icon: '🔒', label: 'Closed & Confirmed' },
+  Reopened: { color: '#DC2626', icon: '🔄', label: 'Reopened by Citizen' },
   Escalated: { color: '#DC2626', icon: '🚨', label: 'SLA Escalated' },
 };
 
@@ -60,9 +70,28 @@ export default function ComplaintDetailScreen({ route, navigation }) {
   const [refreshing, setRefreshing] = useState(false);
   const [classifying, setClassifying] = useState(false);
 
+  // Resolution & Dispute states (Step 2)
+  const [confirming, setConfirming] = useState(false);
+  const [disputeModalVisible, setDisputeModalVisible] = useState(false);
+  const [disputeReason, setDisputeReason] = useState('');
+  const [disputePhoto, setDisputePhoto] = useState(null);
+  const [disputing, setDisputing] = useState(false);
+  const [resolvingDev, setResolvingDev] = useState(false);
+
   const fetchComplaint = useCallback(async () => {
     try {
-      // 1. Fetch complaint directly (safe from RLS infinite recursion)
+      // 1. Try backend API first for rich joined data + real immutable audit trail
+      try {
+        const detail = await fetchComplaintDetail(complaintId);
+        if (detail && detail.id) {
+          setComplaint(detail);
+          return;
+        }
+      } catch (_) {
+        // Fallback to Supabase direct query below
+      }
+
+      // 2. Fallback: Fetch directly from Supabase
       const { data, error } = await supabase
         .from('complaints')
         .select('*')
@@ -71,7 +100,6 @@ export default function ComplaintDetailScreen({ route, navigation }) {
 
       if (error) throw error;
       if (data) {
-        // Map ward and department names
         const wardName = data.ward_id
           ? KNOWN_WARDS[data.ward_id] || 'W-01 — Thapar / Bhadson Road'
           : null;
@@ -79,7 +107,7 @@ export default function ComplaintDetailScreen({ route, navigation }) {
           ? KNOWN_DEPARTMENTS[data.department_id] || 'General Maintenance'
           : null;
 
-        // Build audit trail entries
+        // Build fallback audit trail
         const logs = [
           {
             id: 'log-1',
@@ -102,6 +130,39 @@ export default function ComplaintDetailScreen({ route, navigation }) {
           });
         }
 
+        if (data.status === 'Resolved' || data.resolved_at) {
+          logs.push({
+            id: 'log-3',
+            action: 'official_resolved',
+            new_value: 'Resolved',
+            actor_role: 'official',
+            notes: data.resolution_notes || 'Municipal official completed repair work.',
+            created_at: data.resolved_at || data.updated_at,
+          });
+        }
+
+        if (data.status === 'Closed' || data.closed_at) {
+          logs.push({
+            id: 'log-4',
+            action: 'citizen_confirmed',
+            new_value: 'Closed',
+            actor_role: 'citizen',
+            notes: 'Citizen confirmed resolution. Ticket closed.',
+            created_at: data.closed_at || data.updated_at,
+          });
+        }
+
+        if (data.status === 'Reopened') {
+          logs.push({
+            id: 'log-5',
+            action: 'citizen_disputed',
+            new_value: 'Reopened',
+            actor_role: 'citizen',
+            notes: 'Resolution disputed by citizen.',
+            created_at: data.updated_at,
+          });
+        }
+
         setComplaint({
           ...data,
           ward_name: wardName,
@@ -110,7 +171,7 @@ export default function ComplaintDetailScreen({ route, navigation }) {
         });
       }
     } catch (err) {
-      console.warn('Error fetching complaint from Supabase:', err.message);
+      console.warn('Error fetching complaint:', err.message);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -145,13 +206,11 @@ export default function ComplaintDetailScreen({ route, navigation }) {
   const runAiAnalysis = async () => {
     setClassifying(true);
     try {
-      // 1. Mark as pending in Supabase so the background worker immediately classifies it
       await supabase
         .from('complaints')
         .update({ status: 'Submitted', category: 'pending' })
         .eq('id', complaintId);
 
-      // 2. Also try direct API ping in parallel (non-blocking)
       try {
         await triggerAiClassification(complaintId);
       } catch (_) {}
@@ -164,6 +223,108 @@ export default function ComplaintDetailScreen({ route, navigation }) {
     } finally {
       setClassifying(false);
     }
+  };
+
+  // Step 2: Citizen Confirmation
+  const handleConfirmResolution = () => {
+    Alert.alert(
+      'Confirm Issue Resolution',
+      'Are you satisfied that the municipal department has resolved this issue? This will permanently close the ticket.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Confirm & Close Ticket',
+          style: 'default',
+          onPress: async () => {
+            setConfirming(true);
+            try {
+              await confirmComplaintResolution(complaintId);
+              Alert.alert('Resolution Confirmed! 🎉', 'Thank you for verifying and holding municipal authorities accountable.');
+              await fetchComplaint();
+            } catch (err) {
+              Alert.alert('Error', err.message || 'Failed to confirm resolution.');
+            } finally {
+              setConfirming(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  // Step 2: Snap Dispute Photo
+  const handleCaptureDisputePhoto = async () => {
+    try {
+      const { status } = await ImagePicker.requestCameraPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission Denied', 'Camera access is required to take proof photos.');
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({
+        allowsEditing: true,
+        quality: 0.7,
+      });
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        setDisputePhoto(result.assets[0]);
+      }
+    } catch (e) {
+      console.warn('Error launching camera:', e);
+    }
+  };
+
+  // Step 2: Citizen Dispute Submission
+  const handleSubmitDispute = async () => {
+    if (!disputeReason.trim()) {
+      Alert.alert('Reason Required', 'Please provide a brief reason explaining why the resolution is unsatisfactory.');
+      return;
+    }
+    setDisputing(true);
+    try {
+      await disputeComplaintResolution(complaintId, {
+        reason: disputeReason.trim(),
+        photoUri: disputePhoto?.uri,
+      });
+      setDisputeModalVisible(false);
+      setDisputeReason('');
+      setDisputePhoto(null);
+      Alert.alert(
+        'Dispute Submitted 🔄',
+        'Your dispute has been logged. The complaint is now Reopened and returned to the department supervisor for remedial inspection.'
+      );
+      await fetchComplaint();
+    } catch (err) {
+      Alert.alert('Dispute Failed', err.message || 'Could not submit dispute.');
+    } finally {
+      setDisputing(false);
+    }
+  };
+
+  // Dev / Testing Helper: Simulate Official Resolution
+  const handleDevSimulateResolve = () => {
+    Alert.alert(
+      '🛠️ Simulate Official Resolution',
+      'Mark this ticket as Resolved with official notes and proof to test the Citizen Confirm / Dispute loop?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Mark Resolved',
+          onPress: async () => {
+            setResolvingDev(true);
+            try {
+              await resolveComplaintByOfficial(complaintId, {
+                resolutionNotes: 'Field crew dispatched: Pothole filled with cold-mix asphalt, leveled, and compacted. Site cleared for traffic.',
+              });
+              Alert.alert('Simulated Resolution', 'Complaint status is now "Resolved". You can now test Confirm or Dispute!');
+              await fetchComplaint();
+            } catch (err) {
+              Alert.alert('Error', err.message || 'Failed to simulate resolution.');
+            } finally {
+              setResolvingDev(false);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const copyId = () => {
@@ -232,6 +393,10 @@ export default function ComplaintDetailScreen({ route, navigation }) {
                 <Text style={styles.statusSubtext}>
                   Routed to {complaint.department_name || 'Municipal Department'}
                 </Text>
+              ) : complaint.status === 'Resolved' ? (
+                <Text style={styles.statusSubtext}>
+                  Official submitted resolution proof. Awaiting your verification.
+                </Text>
               ) : (
                 <Text style={styles.statusSubtext}>Tracking municipal ticket</Text>
               )}
@@ -239,7 +404,139 @@ export default function ComplaintDetailScreen({ route, navigation }) {
           </View>
         </View>
 
-        {/* Photo Card */}
+        {/* Step 2: Official Resolution Proof Card (shows when resolved, closed, or reopened) */}
+        {(complaint.resolution_notes || complaint.resolution_photo_url || complaint.status === 'Resolved') && (
+          <View style={[styles.card, styles.resolutionCard]}>
+            <View style={styles.resolutionHeaderRow}>
+              <Text style={styles.resolutionCardTitle}>🛠️ Official Resolution Report</Text>
+              <View
+                style={[
+                  styles.resolutionBadge,
+                  complaint.status === 'Resolved' && { backgroundColor: '#ECFDF5', borderColor: '#10B981' },
+                  complaint.status === 'Closed' && { backgroundColor: '#F1F5F9', borderColor: '#64748B' },
+                  complaint.status === 'Reopened' && { backgroundColor: '#FEF2F2', borderColor: '#EF4444' },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.resolutionBadgeText,
+                    complaint.status === 'Resolved' && { color: '#059669' },
+                    complaint.status === 'Closed' && { color: '#475569' },
+                    complaint.status === 'Reopened' && { color: '#DC2626' },
+                  ]}
+                >
+                  {complaint.status === 'Resolved' ? 'Pending Citizen Verification' : complaint.status}
+                </Text>
+              </View>
+            </View>
+
+            {complaint.resolution_photo_url && (
+              <View style={styles.resolutionPhotoContainer}>
+                <Image
+                  source={{ uri: complaint.resolution_photo_url }}
+                  style={styles.resolutionPhoto}
+                  resizeMode="cover"
+                />
+                <View style={styles.resolutionPhotoBadge}>
+                  <Text style={styles.resolutionPhotoBadgeText}>📸 Official Proof Photo</Text>
+                </View>
+              </View>
+            )}
+
+            {complaint.resolution_notes && (
+              <View style={styles.resolutionNotesBox}>
+                <Text style={styles.resolutionNotesLabel}>Official Remarks:</Text>
+                <Text style={styles.resolutionNotesText}>{complaint.resolution_notes}</Text>
+              </View>
+            )}
+
+            {complaint.resolved_at && (
+              <Text style={styles.resolutionTimestamp}>
+                Completed: {new Date(complaint.resolved_at).toLocaleString('en-IN', {
+                  day: 'numeric',
+                  month: 'short',
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </Text>
+            )}
+          </View>
+        )}
+
+        {/* Step 2: Citizen Verification Box (Active ONLY when Resolved) */}
+        {complaint.status === 'Resolved' && (
+          <View style={styles.actionCard}>
+            <View style={styles.actionPromptHeader}>
+              <Text style={{ fontSize: 26, marginRight: Spacing.sm }}>⚖️</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.actionPromptTitle}>Citizen Verification Required</Text>
+                <Text style={styles.actionPromptSubtitle}>
+                  Municipal officials reported this issue as resolved. Please inspect the site and confirm or dispute below:
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.actionButtonsRow}>
+              {/* Confirm Resolution Button */}
+              <TouchableOpacity
+                style={[styles.confirmBtn, confirming && { opacity: 0.6 }]}
+                onPress={handleConfirmResolution}
+                disabled={confirming}
+              >
+                {confirming ? (
+                  <ActivityIndicator color={Colors.white} size="small" />
+                ) : (
+                  <>
+                    <Text style={styles.confirmBtnIcon}>✅</Text>
+                    <Text style={styles.confirmBtnText}>Confirm Resolution</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+
+              {/* Dispute Resolution Button */}
+              <TouchableOpacity
+                style={styles.disputeBtn}
+                onPress={() => setDisputeModalVisible(true)}
+              >
+                <Text style={styles.disputeBtnIcon}>❌</Text>
+                <Text style={styles.disputeBtnText}>Dispute Work</Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.autoCloseHint}>
+              ⏱️ SLA Policy: If no citizen action is taken within 7 days, this ticket auto-closes (FR-C7).
+            </Text>
+          </View>
+        )}
+
+        {/* Closed Banner */}
+        {complaint.status === 'Closed' && (
+          <View style={styles.closedBanner}>
+            <Text style={{ fontSize: 22, marginRight: Spacing.sm }}>🎉</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.closedBannerTitle}>Ticket Closed & Confirmed</Text>
+              <Text style={styles.closedBannerSub}>
+                Citizen verified resolution. This municipal ticket is officially completed and archived.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {/* Reopened Banner */}
+        {complaint.status === 'Reopened' && (
+          <View style={styles.reopenedBanner}>
+            <Text style={{ fontSize: 22, marginRight: Spacing.sm }}>🔄</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.reopenedBannerTitle}>Resolution Disputed — Ticket Reopened</Text>
+              <Text style={styles.reopenedBannerSub}>
+                Returned to the municipal supervisor for remedial inspection and rework.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {/* Complaint Photo Card */}
         {complaint.photo_url ? (
           <View style={styles.photoContainer}>
             <Image
@@ -432,6 +729,23 @@ export default function ComplaintDetailScreen({ route, navigation }) {
           </View>
         )}
 
+        {/* Dev / Test Helper: Simulate Official Resolution */}
+        {['Assigned', 'In Progress', 'Escalated'].includes(complaint.status) && (
+          <TouchableOpacity
+            style={[styles.devResolveBtn, resolvingDev && { opacity: 0.6 }]}
+            onPress={handleDevSimulateResolve}
+            disabled={resolvingDev}
+          >
+            {resolvingDev ? (
+              <ActivityIndicator color={Colors.primary} size="small" />
+            ) : (
+              <Text style={styles.devResolveBtnText}>
+                🛠️ [Test Step 2] Simulate Official Marking as Resolved
+              </Text>
+            )}
+          </TouchableOpacity>
+        )}
+
         {/* Re-analyze Button for testing / updating */}
         <TouchableOpacity
           style={[styles.classifyButton, classifying && { opacity: 0.6 }]}
@@ -447,6 +761,87 @@ export default function ComplaintDetailScreen({ route, navigation }) {
 
         <Text style={styles.pullHint}>Pull down to refresh ticket status</Text>
       </ScrollView>
+
+      {/* Step 2: Dispute Resolution Modal */}
+      <Modal
+        visible={disputeModalVisible}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setDisputeModalVisible(false)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.modalOverlay}
+        >
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Dispute Issue Resolution</Text>
+              <TouchableOpacity onPress={() => setDisputeModalVisible(false)}>
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.modalSub}>
+              Explain why this civic work is incomplete or unsatisfactory. Your complaint will be reopened and escalated back to the municipal supervisor.
+            </Text>
+
+            <TextInput
+              style={styles.disputeInput}
+              placeholder="e.g. The pothole was only partially filled with loose gravel and washed away with recent rain..."
+              placeholderTextColor={Colors.textMuted}
+              value={disputeReason}
+              onChangeText={setDisputeReason}
+              multiline
+              numberOfLines={4}
+              textAlignVertical="top"
+            />
+
+            {/* Optional Proof Photo */}
+            {disputePhoto ? (
+              <View style={styles.disputePhotoPreviewContainer}>
+                <Image source={{ uri: disputePhoto.uri }} style={styles.disputePhotoPreview} />
+                <TouchableOpacity
+                  style={styles.removePhotoBtn}
+                  onPress={() => setDisputePhoto(null)}
+                >
+                  <Text style={styles.removePhotoText}>Remove Photo ✕</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={styles.attachPhotoBtn}
+                onPress={handleCaptureDisputePhoto}
+              >
+                <Text style={styles.attachPhotoBtnText}>📷 Snap Proof Photo (Optional)</Text>
+              </TouchableOpacity>
+            )}
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setDisputeModalVisible(false)}
+              >
+                <Text style={styles.modalCancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.modalSubmitBtn,
+                  (!disputeReason.trim() || disputing) && { opacity: 0.5 },
+                ]}
+                onPress={handleSubmitDispute}
+                disabled={!disputeReason.trim() || disputing}
+              >
+                {disputing ? (
+                  <ActivityIndicator color={Colors.white} size="small" />
+                ) : (
+                  <Text style={styles.modalSubmitBtnText}>Submit Dispute</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -512,6 +907,202 @@ const styles = StyleSheet.create({
   statusSubtext: {
     fontSize: FontSize.xs,
     color: Colors.textSecondary,
+    marginTop: 2,
+  },
+
+  // Resolution Card
+  resolutionCard: {
+    borderLeftWidth: 4,
+    borderLeftColor: '#10B981',
+    backgroundColor: '#F0FDF4',
+  },
+  resolutionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: Spacing.md,
+  },
+  resolutionCardTitle: {
+    fontSize: FontSize.md,
+    fontWeight: '700',
+    color: '#065F46',
+  },
+  resolutionBadge: {
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 3,
+    borderRadius: Radius.full,
+    borderWidth: 1,
+  },
+  resolutionBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  resolutionPhotoContainer: {
+    borderRadius: Radius.md,
+    overflow: 'hidden',
+    position: 'relative',
+    marginBottom: Spacing.sm,
+  },
+  resolutionPhoto: {
+    width: '100%',
+    height: 180,
+    backgroundColor: Colors.cardBg,
+  },
+  resolutionPhotoBadge: {
+    position: 'absolute',
+    bottom: Spacing.sm,
+    left: Spacing.sm,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 3,
+    borderRadius: Radius.sm,
+  },
+  resolutionPhotoBadgeText: {
+    color: Colors.white,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  resolutionNotesBox: {
+    backgroundColor: Colors.white,
+    padding: Spacing.md,
+    borderRadius: Radius.md,
+    marginBottom: Spacing.sm,
+    borderWidth: 1,
+    borderColor: '#D1FAE5',
+  },
+  resolutionNotesLabel: {
+    fontSize: FontSize.xs,
+    fontWeight: '700',
+    color: '#047857',
+    marginBottom: 2,
+  },
+  resolutionNotesText: {
+    fontSize: FontSize.sm,
+    color: Colors.textPrimary,
+    lineHeight: 20,
+  },
+  resolutionTimestamp: {
+    fontSize: FontSize.xs,
+    color: '#059669',
+    textAlign: 'right',
+  },
+
+  // Citizen Action Card
+  actionCard: {
+    backgroundColor: Colors.cardBg,
+    borderRadius: Radius.lg,
+    padding: Spacing.lg,
+    marginBottom: Spacing.base,
+    borderWidth: 2,
+    borderColor: '#10B981',
+    ...Shadows.md,
+  },
+  actionPromptHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: Spacing.base,
+  },
+  actionPromptTitle: {
+    fontSize: FontSize.base,
+    fontWeight: '700',
+    color: Colors.textPrimary,
+  },
+  actionPromptSubtitle: {
+    fontSize: FontSize.xs,
+    color: Colors.textSecondary,
+    marginTop: 2,
+    lineHeight: 18,
+  },
+  actionButtonsRow: {
+    flexDirection: 'row',
+    gap: Spacing.sm,
+    marginBottom: Spacing.sm,
+  },
+  confirmBtn: {
+    flex: 1.2,
+    backgroundColor: '#059669',
+    paddingVertical: Spacing.md,
+    borderRadius: Radius.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...Shadows.sm,
+  },
+  confirmBtnIcon: {
+    fontSize: 16,
+    marginRight: 6,
+  },
+  confirmBtnText: {
+    color: Colors.white,
+    fontSize: FontSize.sm,
+    fontWeight: '700',
+  },
+  disputeBtn: {
+    flex: 1,
+    backgroundColor: Colors.cardBg,
+    borderColor: '#DC2626',
+    borderWidth: 1.5,
+    paddingVertical: Spacing.md,
+    borderRadius: Radius.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  disputeBtnIcon: {
+    fontSize: 14,
+    marginRight: 6,
+  },
+  disputeBtnText: {
+    color: '#DC2626',
+    fontSize: FontSize.sm,
+    fontWeight: '700',
+  },
+  autoCloseHint: {
+    fontSize: 11,
+    color: Colors.textMuted,
+    textAlign: 'center',
+    marginTop: Spacing.xs,
+  },
+
+  // Banners for Closed & Reopened
+  closedBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F1F5F9',
+    borderColor: '#94A3B8',
+    borderWidth: 1,
+    padding: Spacing.md,
+    borderRadius: Radius.md,
+    marginBottom: Spacing.base,
+  },
+  closedBannerTitle: {
+    fontSize: FontSize.sm,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  closedBannerSub: {
+    fontSize: FontSize.xs,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  reopenedBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF2F2',
+    borderColor: '#FCA5A5',
+    borderWidth: 1,
+    padding: Spacing.md,
+    borderRadius: Radius.md,
+    marginBottom: Spacing.base,
+  },
+  reopenedBannerTitle: {
+    fontSize: FontSize.sm,
+    fontWeight: '700',
+    color: '#991B1B',
+  },
+  reopenedBannerSub: {
+    fontSize: FontSize.xs,
+    color: '#B91C1C',
     marginTop: 2,
   },
 
@@ -738,6 +1329,23 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 
+  // Dev simulation button
+  devResolveBtn: {
+    backgroundColor: '#F3E8FF',
+    borderColor: '#A855F7',
+    borderWidth: 1,
+    borderRadius: Radius.lg,
+    paddingVertical: Spacing.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: Spacing.base,
+  },
+  devResolveBtnText: {
+    color: '#7E22CE',
+    fontSize: FontSize.sm,
+    fontWeight: '700',
+  },
+
   // Action Buttons
   classifyButton: {
     backgroundColor: Colors.primary + '15',
@@ -759,5 +1367,116 @@ const styles = StyleSheet.create({
     fontSize: FontSize.xs,
     color: Colors.textMuted,
     marginTop: Spacing.sm,
+  },
+
+  // Dispute Modal Styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'flex-end',
+  },
+  modalContainer: {
+    backgroundColor: Colors.cardBg,
+    borderTopLeftRadius: Radius.xl,
+    borderTopRightRadius: Radius.xl,
+    padding: Spacing.xl,
+    maxHeight: '90%',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: Spacing.sm,
+  },
+  modalTitle: {
+    fontSize: FontSize.lg,
+    fontWeight: '700',
+    color: Colors.textPrimary,
+  },
+  modalCloseText: {
+    fontSize: 20,
+    color: Colors.textMuted,
+    padding: Spacing.xs,
+  },
+  modalSub: {
+    fontSize: FontSize.xs,
+    color: Colors.textSecondary,
+    lineHeight: 18,
+    marginBottom: Spacing.base,
+  },
+  disputeInput: {
+    backgroundColor: Colors.bg,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: Radius.md,
+    padding: Spacing.md,
+    fontSize: FontSize.sm,
+    color: Colors.textPrimary,
+    minHeight: 100,
+    marginBottom: Spacing.base,
+  },
+  attachPhotoBtn: {
+    backgroundColor: Colors.bg,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderStyle: 'dashed',
+    borderRadius: Radius.md,
+    paddingVertical: Spacing.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: Spacing.lg,
+  },
+  attachPhotoBtnText: {
+    fontSize: FontSize.xs,
+    color: Colors.primary,
+    fontWeight: '600',
+  },
+  disputePhotoPreviewContainer: {
+    marginBottom: Spacing.lg,
+    alignItems: 'center',
+  },
+  disputePhotoPreview: {
+    width: '100%',
+    height: 140,
+    borderRadius: Radius.md,
+    backgroundColor: Colors.bg,
+  },
+  removePhotoBtn: {
+    marginTop: Spacing.xs,
+  },
+  removePhotoText: {
+    fontSize: FontSize.xs,
+    color: '#DC2626',
+    fontWeight: '600',
+  },
+  modalActions: {
+    flexDirection: 'row',
+    gap: Spacing.md,
+  },
+  modalCancelBtn: {
+    flex: 1,
+    paddingVertical: Spacing.md,
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    alignItems: 'center',
+  },
+  modalCancelBtnText: {
+    fontSize: FontSize.sm,
+    color: Colors.textSecondary,
+    fontWeight: '600',
+  },
+  modalSubmitBtn: {
+    flex: 1.5,
+    backgroundColor: '#DC2626',
+    paddingVertical: Spacing.md,
+    borderRadius: Radius.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalSubmitBtnText: {
+    fontSize: FontSize.sm,
+    color: Colors.white,
+    fontWeight: '700',
   },
 });

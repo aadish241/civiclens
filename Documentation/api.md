@@ -17,6 +17,11 @@ The backend runs on **FastAPI** (`http://<host>:8000`), serving RESTful endpoint
 | `GET` | `/api/complaints` | Complaints | No (v1) | Paginated list of complaints with optional status filter |
 | `GET` | `/api/complaints/{complaint_id}` | Complaints | No (v1) | Full complaint details with joined ward/dept names and audit trail |
 | `POST` | `/api/complaints/{complaint_id}/classify` | Complaints | No (Admin/Dev) | Trigger on-demand AI vision classification and routing pipeline |
+| `POST` | `/api/complaints/{complaint_id}/confirm` | Citizen Loop | No (v1) | Citizen confirms resolution (FR-C7: Resolved -> Closed) |
+| `POST` | `/api/complaints/{complaint_id}/dispute` | Citizen Loop | No (v1) | Citizen disputes resolution with reason & photo (FR-C7: Resolved -> Reopened) |
+| `POST` | `/api/complaints/{complaint_id}/resolve` | Official | No (v1) | Official resolves complaint with proof notes & photo (FR-O4) |
+| `POST` | `/api/sla/check` | SLA / Automation | No (Admin/Dev) | Manually trigger SLA escalation scan for overdue complaints |
+| `POST` | `/api/sla/auto-close` | SLA / Automation | No (Admin/Dev) | Manually trigger auto-close check for 7-day stale resolved tickets |
 | `GET` | `/api/complaints/heatmap` | Public / Geospatial | No | Anonymized geospatial points for map rendering (DPDP compliant) |
 
 ---
@@ -240,6 +245,128 @@ Returns anonymized complaint geographic coordinates, category, severity, and sta
 
 ---
 
+### 1.4 Citizen Resolution Loop (FR-C7)
+
+#### `POST /api/complaints/{complaint_id}/confirm`
+Citizen confirms that the reported civic defect has been satisfactorily resolved. Transitions complaint status from `Resolved` to `Closed`, stamps `closed_at`, and records an immutable audit entry.
+
+- **HTTP Method**: `POST`
+- **Path**: `/api/complaints/{complaint_id}/confirm`
+- **Authentication**: None (v1) / Citizen JWT (Phase 4)
+- **Request Content-Type**: `application/json`
+- **Request Body (`ConfirmResolutionRequest`)**:
+  ```json
+  {
+    "notes": "Verified on site. Roadway is smooth and cleared."
+  }
+  ```
+- **Response Status Code**: `200 OK`
+- **Response Schema (`ResolutionActionResponse`)**:
+  ```json
+  {
+    "id": "5effdf40-876a-489d-82d7-3cae3ae92758",
+    "status": "Closed",
+    "message": "Resolution confirmed successfully. Complaint is now Closed."
+  }
+  ```
+- **Error Responses**:
+  - `400 Bad Request`: Complaint is not in `Resolved` status.
+  - `404 Not Found`: Complaint not found.
+
+---
+
+#### `POST /api/complaints/{complaint_id}/dispute`
+Citizen disputes that the issue was resolved (e.g. work incomplete or defect still hazardous). Transitions status from `Resolved` to `Reopened`, optionally uploads citizen proof photo, and appends an immutable dispute audit entry.
+
+- **HTTP Method**: `POST`
+- **Path**: `/api/complaints/{complaint_id}/dispute`
+- **Authentication**: None (v1) / Citizen JWT (Phase 4)
+- **Request Content-Type**: `multipart/form-data`
+- **Request Form Fields**:
+  | Field | Type | Required | Description |
+  |---|---|---|---|
+  | `reason` | `string` | **Yes** | Detailed explanation of why the repair is incomplete. |
+  | `photo` | `UploadFile` (binary) | No | Optional live photo proof taken by citizen showing unresolved issue. |
+- **Response Status Code**: `200 OK`
+- **Response Schema (`ResolutionActionResponse`)**:
+  ```json
+  {
+    "id": "5effdf40-876a-489d-82d7-3cae3ae92758",
+    "status": "Reopened",
+    "message": "Resolution disputed. Complaint has been reopened and returned to the department queue."
+  }
+  ```
+- **Error Responses**:
+  - `400 Bad Request`: Complaint is not in `Resolved` status.
+  - `404 Not Found`: Complaint not found.
+
+---
+
+### 1.5 Official Resolution Resource (FR-O4)
+
+#### `POST /api/complaints/{complaint_id}/resolve`
+Municipal official marks an active complaint (`Assigned`, `In Progress`, `Escalated`, or `Reopened`) as `Resolved`. Attaches mandatory repair notes and optional proof photo of the completed work. Opens the 7-day citizen confirmation window.
+
+- **HTTP Method**: `POST`
+- **Path**: `/api/complaints/{complaint_id}/resolve`
+- **Authentication**: None (v1) / Official JWT (Phase 4)
+- **Request Content-Type**: `multipart/form-data`
+- **Request Form Fields**:
+  | Field | Type | Required | Description |
+  |---|---|---|---|
+  | `resolution_notes` | `string` | **Yes** | Engineering remarks describing the repair work completed. |
+  | `resolution_photo` | `UploadFile` (binary) | No | Official proof photo of the completed site. |
+- **Response Status Code**: `200 OK`
+- **Response Schema (`ResolutionActionResponse`)**:
+  ```json
+  {
+    "id": "5effdf40-876a-489d-82d7-3cae3ae92758",
+    "status": "Resolved",
+    "message": "Complaint marked as Resolved. Citizen confirmation window is now active."
+  }
+  ```
+
+---
+
+### 1.6 SLA Governance & Automation Endpoints
+
+#### `POST /api/sla/check`
+On-demand trigger to scan for active complaints (`Assigned`, `In Progress`) whose `sla_deadline < NOW()`. Overdue tickets are auto-escalated to `Escalated` status and audit logged. (The background worker already executes this every 60 seconds automatically).
+
+- **HTTP Method**: `POST`
+- **Path**: `/api/sla/check`
+- **Authentication**: None (Admin/Dev)
+- **Response Status Code**: `200 OK`
+- **Response Example**:
+  ```json
+  {
+    "escalated_count": 1,
+    "message": "SLA check complete. 1 complaint(s) escalated."
+  }
+  ```
+
+---
+
+#### `POST /api/sla/auto-close`
+On-demand trigger to scan for complaints that have been in `Resolved` status for $\ge$ `days` (default: 7) without citizen confirmation or dispute. Automatically transitions them to `Closed`.
+
+- **HTTP Method**: `POST`
+- **Path**: `/api/sla/auto-close`
+- **Query Parameters**:
+  | Parameter | Type | Default | Description |
+  |---|---|---|---|
+  | `days` | `integer` | `7` | Stale threshold in days (`1 <= days <= 30`). |
+- **Response Status Code**: `200 OK`
+- **Response Example**:
+  ```json
+  {
+    "closed_count": 0,
+    "message": "No stale resolved complaints found."
+  }
+  ```
+
+---
+
 ## 2. Direct Supabase Client Resources
 
 To eliminate cellular network bottlenecks and bypass local network firewalls, the React Native client interacts directly with Supabase cloud endpoints for low-latency CRUD operations:
@@ -255,3 +382,11 @@ To eliminate cellular network bottlenecks and bypass local network firewalls, th
 - `GET /rest/v1/complaints?id=eq.{id}&select=*`: Direct polling (< 100ms) by `ComplaintDetailScreen.js` every 2.5s.
 - `GET /rest/v1/complaints?select=status`: Aggregated query used by `HomeScreen.js` to compute live stats counters (*Submitted*, *In Progress*, *Resolved*).
 - `GET /rest/v1/complaints?select=*&order=created_at.desc`: User ticket history used by `MyComplaintsScreen.js`.
+
+### 2.3 Community Upvoting Interface (`complaint_upvotes`)
+- **Table**: `complaint_upvotes (id, complaint_id, user_id, created_at)`
+- **Composite Primary Key**: `(complaint_id, user_id)` guarantees one upvote per user per ticket.
+- **Toggle Upvote**:
+  - `POST /rest/v1/complaint_upvotes`: Inserts upvote record.
+  - `DELETE /rest/v1/complaint_upvotes?complaint_id=eq.{cid}&user_id=eq.{uid}`: Removes upvote record.
+- **Database Trigger**: `sync_complaint_upvote_count` automatically updates `complaints.upvote_count` using atomic `COUNT(*)` in PostgreSQL.

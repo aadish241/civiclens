@@ -32,9 +32,20 @@ export default function MyComplaintsScreen({ navigation }) {
   const [refreshing, setRefreshing] = useState(false);
 
   const fetchComplaints = useCallback(async () => {
+    // Get the current user's ID
+    const { data: { session } } = await supabase.auth.getSession();
+    const userId = session?.user?.id;
+
+    if (!userId) {
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
+
     const { data, error } = await supabase
       .from('complaints')
       .select('id, description, category, severity, status, photo_url, created_at')
+      .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (!error && data) {
